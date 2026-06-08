@@ -7,7 +7,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: cloudflare/wrangler-action@v4
-        with:
-          apiKey: ${{ secrets.CF_GLOBAL_KEY }}
-          email: ${{ secrets.CF_EMAIL }}
+
+      - name: Create metadata
+        run: echo '{"main_module":"worker.js","compatibility_date":"2024-01-01"}' > metadata.json
+
+      - name: Deploy via Cloudflare API
+        run: |
+          curl -X PUT "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/workers/scripts/clappy-worker" \
+            -H "X-Auth-Email: ${{ secrets.CF_EMAIL }}" \
+            -H "X-Auth-Key: ${{ secrets.CF_GLOBAL_KEY }}" \
+            -F "metadata=@metadata.json;type=application/json" \
+            -F "worker.js=@worker.js;type=application/javascript+module"

@@ -9,4 +9,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cloudflare/wrangler-action@v4
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
+          apiKey: ${{ secrets.CF_GLOBAL_KEY }}
+          email: ${{ secrets.CF_EMAIL }}

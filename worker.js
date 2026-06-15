@@ -107,7 +107,7 @@ export default {
           },
           body: JSON.stringify({
             model:       'llama-3.1-8b-instant',
-            max_tokens:  400,
+            max_tokens:  250,
             temperature: 0.82,
             messages:    messages,
           }),
@@ -144,4 +144,4 @@ function jsonRes(obj, status = 200) {
     },
   });
         }
-          
+            

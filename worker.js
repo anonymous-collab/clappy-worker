@@ -5,15 +5,30 @@
 //   GET  /          -> health check
 //   OPTIONS *       -> CORS preflight
 
+const ALLOWED_ORIGINS = [
+  'https://moviesupdate.online',
+  'https://www.moviesupdate.online',
+  'https://relaxed-kringle-570cc0.netlify.app',
+];
+
+function getAllowedOrigin(request) {
+  const origin = request.headers.get('Origin') || '';
+  return ALLOWED_ORIGINS.includes(origin) ? origin : null;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const allowedOrigin = getAllowedOrigin(request);
 
     // ---- CORS preflight (all routes) ----
     if (request.method === 'OPTIONS') {
+      if (!allowedOrigin) {
+        return new Response('Forbidden', { status: 403 });
+      }
       return new Response(null, {
         headers: {
-          'Access-Control-Allow-Origin':  '*',
+          'Access-Control-Allow-Origin':  allowedOrigin,
           'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type',
         },
@@ -21,20 +36,17 @@ export default {
     }
 
     // ---- Gemini grounded-search fallback ----
-    // GET /gemini-search?q=<url-encoded query>
-    // Called by ai.js only when TMDb + Wikipedia + News all came back
-    // empty for a likely-2025/2026 title. Holds the Gemini key server-side.
     if (request.method === 'GET' && url.pathname === '/gemini-search') {
       const query = url.searchParams.get('q');
 
       if (!query || query.trim().length < 2) {
-        return jsonRes({ text: '' }, 400);
+        return jsonRes({ text: '' }, 400, allowedOrigin);
       }
 
       const apiKey = env.GEMINI_API_KEY;
       if (!apiKey) {
         console.error('GEMINI_API_KEY secret is not set on this worker.');
-        return jsonRes({ text: '' }, 200);
+        return jsonRes({ text: '' }, 200, allowedOrigin);
       }
 
       const prompt =
@@ -71,32 +83,35 @@ export default {
         if (!geminiRes.ok) {
           const errBody = await geminiRes.text().catch(() => '');
           console.warn('Gemini non-OK:', geminiRes.status, errBody.slice(0, 200));
-          return jsonRes({ text: '' }, 200);
+          return jsonRes({ text: '' }, 200, allowedOrigin);
         }
 
         const data = await geminiRes.json();
         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
-        return jsonRes({ text: text.trim() });
+        return jsonRes({ text: text.trim() }, 200, allowedOrigin);
 
       } catch (err) {
         console.error('Gemini fallback error:', err.message || err);
-        return jsonRes({ text: '' }, 200);
+        return jsonRes({ text: '' }, 200, allowedOrigin);
       }
     }
 
     // ---- Health check ----
     if (request.method === 'GET') {
-      return jsonRes({ status: 'Clappy Worker running! 🎬' });
+      return jsonRes({ status: 'Clappy Worker running! 🎬' }, 200, allowedOrigin);
     }
 
     // ---- Main Groq chat endpoint ----
     if (request.method === 'POST') {
+      if (!allowedOrigin) {
+        return jsonRes({ error: 'Forbidden' }, 403, null);
+      }
       try {
         const body     = await request.json();
         const messages = body.messages;
 
         if (!messages) {
-          return jsonRes({ error: 'No messages provided' }, 400);
+          return jsonRes({ error: 'No messages provided' }, 400, allowedOrigin);
         }
 
         const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -116,32 +131,32 @@ export default {
         const data = await groqResponse.json();
 
         if (data.error) {
-          return jsonRes({ error: data.error.message }, 500);
+          return jsonRes({ error: data.error.message }, 500, allowedOrigin);
         }
 
         const reply = data?.choices?.[0]?.message?.content;
 
         if (!reply) {
-          return jsonRes({ error: 'No reply from Groq' }, 500);
+          return jsonRes({ error: 'No reply from Groq' }, 500, allowedOrigin);
         }
 
-        return jsonRes({ reply });
+        return jsonRes({ reply }, 200, allowedOrigin);
 
       } catch (err) {
-        return jsonRes({ error: err.message }, 500);
+        return jsonRes({ error: err.message }, 500, allowedOrigin);
       }
     }
   },
 };
 
 // ---- shared helper ----
-function jsonRes(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      'Content-Type':                'application/json',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
-        }
-            
+function jsonRes(obj, status = 200, origin = null) {
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+  if (origin) {
+    headers['Access-Control-Allow-Origin'] = origin;
+  }
+  return new Response(JSON.stringify(obj), { status, headers });
+                          }
+        

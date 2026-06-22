@@ -9,6 +9,7 @@ const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
   'https://relaxed-kringle-570cc0.netlify.app',
+  'http://localhost:8158',
 ];
 
 function getAllowedOrigin(request) {

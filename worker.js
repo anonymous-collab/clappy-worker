@@ -8,7 +8,7 @@
 const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
-  'https://relaxed-kringle-570cc0.netlify.app',
+  'https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
   'http://localhost:8158',
 ];
 

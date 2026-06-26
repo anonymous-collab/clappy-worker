@@ -10,7 +10,7 @@
 const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
-  'https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
+  '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
   'http://localhost:8158',
 ];
 
@@ -203,17 +203,24 @@ One punchy sentence about why they'll love it
 Always present exactly 5 recommendations unless the user explicitly asks for more or fewer.
 Never present fewer than 5 when recommending movies or shows.
 
-RESPONSE STYLE — CRITICAL:
-- NEVER announce what you are about to do. Just do it.
-- WRONG: "Here are some action movie recommendations:"
-- RIGHT: "If you want non-stop thrills, Die Hard (1988) is still unmatched 🎬"
-- WRONG: "Here's a look at some trending sci-fi movies:"
-- RIGHT: "Sci-fi is having a moment right now — here's what's moving:"
-- WRONG: "I found some information about that series:"
-- RIGHT: "Your boy is right — DC's Legends of Tomorrow is genuinely worth your time."
-- React first like a friend would, then deliver the information.
-- If someone says "my friend told me X" or "my boy told me X" — validate or correct it naturally, don't just recite facts.
-- If someone asks for recommendations — jump straight into the picks with personality, don't label the list first.${profileContext}`;
+CRITICAL OUTPUT RULES — NEVER BREAK THESE:
+- NEVER output JSON, function call syntax, citation numbers, or any technical markup
+- NEVER include [cite: ...], [1], [2], <function=...>, {"query":...} in your response
+- If you see citation markers in your data, ignore them completely
+- Your response must read as natural spoken language, nothing else
+
+DATA REWRITING — MANDATORY:
+- When tool data is provided, you MUST rewrite it as natural conversation
+- NEVER copy-paste raw descriptions from tool results — always rephrase in your own voice
+- WRONG: "Interstellar (2014) is a sci-fi film directed by Christopher Nolan about a team of explorers..."
+- RIGHT: "Nolan outdid himself with Interstellar — it follows a crew risking everything to find a new home for humanity, and the emotional payoff by the end is devastating."
+- Transform database descriptions into how a passionate film fan would actually describe a movie
+
+UNRELEASED FILMS — MANDATORY:
+- Tool results include a "released" field (true/false) and "release_date"
+- If released is false, ALWAYS mention it hasn't come out yet
+- Example: "Masters of the Universe (coming July 2026) is already generating buzz for..."
+- Never present an unreleased film the same way as a released one${profileContext}`;
 }
 
 // ============================================
@@ -260,15 +267,22 @@ async function toolMovies(args, env) {
   const res = await fetchWithTimeout(`${TMDB_BASE}${endpoint}`);
   const data = await res.json();
 
-  const results = (data.results || []).slice(0, 8).map(m => ({
-    id: m.id,
-    title: m.title || m.name,
-    year: (m.release_date || m.first_air_date || '').slice(0, 4),
-    rating: m.vote_average?.toFixed(1),
-    overview: (m.overview || '').slice(0, 200),
-    poster: m.poster_path ? `${TMDB_IMG}${m.poster_path}` : null,
-    type: m.media_type || 'movie'
-  }));
+  const now = new Date();
+  const results = (data.results || []).slice(0, 8).map(m => {
+    const releaseDate = m.release_date || m.first_air_date || '';
+    const released = releaseDate ? new Date(releaseDate) <= now : true;
+    return {
+      id: m.id,
+      title: m.title || m.name,
+      year: releaseDate.slice(0, 4),
+      release_date: releaseDate,
+      released,
+      rating: m.vote_average?.toFixed(1),
+      overview: (m.overview || '').slice(0, 200),
+      poster: m.poster_path ? `${TMDB_IMG}${m.poster_path}` : null,
+      type: m.media_type || 'movie'
+    };
+  });
 
   const result = { results, source: 'tmdb' };
   await cacheSet(cacheKey, result, TTL.query, env);
@@ -336,9 +350,14 @@ async function toolWikipedia(args) {
   const res = await fetchWithTimeout(url);
   if (!res.ok) return { error: 'Not found on Wikipedia' };
   const data = await res.json();
+  // Strip citation markers like [1], [2], [cite: 4, 7] before passing to model
+  const cleanSummary = (data.extract || '')
+    .replace(/\[cite:\s*[\d,\s]+\]/g, '')
+    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
+    .slice(0, 500);
   return {
     title: data.title,
-    summary: (data.extract || '').slice(0, 500),
+    summary: cleanSummary,
     source: 'wikipedia'
   };
 }
@@ -625,7 +644,17 @@ async function orchestrate(userMessage, uid, conversationHistory, env, origin) {
       return await gemininFallback(messages, env);
     }
 
-    const reply = finalData.choices[0].message.content;
+    const rawReply = finalData.choices[0].message.content;
+
+    // Server-side cleanup — strip any leaked technical artifacts
+    const reply = rawReply
+      .replace(/\[cite:\s*[\d,\s]+\]/g, '')
+      .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
+      .replace(/<function=[\s\S]*?<\/function>/g, '')
+      .replace(/\{["']?query["']?:[\s\S]*?\}/g, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/  +/g, ' ')
+      .trim();
 
     // Update user profile in background (don't await)
     if (uid) updateUserProfile(uid, userMessage, reply, env).catch(() => {});
@@ -634,8 +663,17 @@ async function orchestrate(userMessage, uid, conversationHistory, env, origin) {
   }
 
   // ── No tool calls — direct conversational reply ──
-  const directReply = assistantMessage?.content;
-  if (directReply) return directReply;
+  const rawDirectReply = assistantMessage?.content;
+  if (rawDirectReply) {
+    return rawDirectReply
+      .replace(/\[cite:\s*[\d,\s]+\]/g, '')
+      .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
+      .replace(/<function=[\s\S]*?<\/function>/g, '')
+      .replace(/\{["']?query["']?:[\s\S]*?\}/g, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/  +/g, ' ')
+      .trim();
+  }
 
   // Absolute last resort
   return await gemininFallback(messages, env);

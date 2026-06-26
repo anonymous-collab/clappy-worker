@@ -200,10 +200,20 @@ MOVIE RECOMMENDATION FORMAT (when listing films):
 🎬 Title (Year) ⭐ Rating/10
 One punchy sentence about why they'll love it
 
-RESPONSE STRUCTURE:
-1. Answer directly and clearly first
-2. ONE brief witty or warm remark if appropriate
-3. Natural follow-up question based on context${profileContext}`;
+Always present exactly 5 recommendations unless the user explicitly asks for more or fewer.
+Never present fewer than 5 when recommending movies or shows.
+
+RESPONSE STYLE — CRITICAL:
+- NEVER announce what you are about to do. Just do it.
+- WRONG: "Here are some action movie recommendations:"
+- RIGHT: "If you want non-stop thrills, Die Hard (1988) is still unmatched 🎬"
+- WRONG: "Here's a look at some trending sci-fi movies:"
+- RIGHT: "Sci-fi is having a moment right now — here's what's moving:"
+- WRONG: "I found some information about that series:"
+- RIGHT: "Your boy is right — DC's Legends of Tomorrow is genuinely worth your time."
+- React first like a friend would, then deliver the information.
+- If someone says "my friend told me X" or "my boy told me X" — validate or correct it naturally, don't just recite facts.
+- If someone asks for recommendations — jump straight into the picks with personality, don't label the list first.${profileContext}`;
 }
 
 // ============================================
@@ -250,7 +260,7 @@ async function toolMovies(args, env) {
   const res = await fetchWithTimeout(`${TMDB_BASE}${endpoint}`);
   const data = await res.json();
 
-  const results = (data.results || []).slice(0, 6).map(m => ({
+  const results = (data.results || []).slice(0, 8).map(m => ({
     id: m.id,
     title: m.title || m.name,
     year: (m.release_date || m.first_air_date || '').slice(0, 4),
@@ -517,7 +527,7 @@ async function orchestrate(userMessage, uid, conversationHistory, env, origin) {
         messages,
         tools: TOOL_DEFINITIONS,
         tool_choice: 'auto',
-        max_tokens: 600,
+        max_tokens: 800,
         temperature: 0.75
       })
     }, 12000);
@@ -600,7 +610,7 @@ async function orchestrate(userMessage, uid, conversationHistory, env, origin) {
         body: JSON.stringify({
           model: GROQ_MODEL,
           messages: finalMessages,
-          max_tokens: 500,
+          max_tokens: 800,
           temperature: 0.75
         })
       }, 12000);

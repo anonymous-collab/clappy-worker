@@ -1,8 +1,9 @@
 // ============================================
-// CLAPPY WORKER v4.2 — Optimized
-// Fixes: tool_use_failed handling, token reduction,
-// dynamic tool selection, schema validation,
-// context compression, tool output trimming
+// CLAPPY WORKER v4.3 — Companion Edition
+// llama-3.3-70b-versatile (function calling)
+// Gemini 2.5 Flash fallback
+// Tools: TMDB, Wikipedia, NewsData
+// Memory: localStorage (loaded once per session)
 // ============================================
 
 const ALLOWED_ORIGINS = [
@@ -20,217 +21,190 @@ const TMDB_BASE     = 'https://api.themoviedb.org/3';
 const TMDB_IMG      = 'https://image.tmdb.org/t/p/w500';
 const WIKI_BASE     = 'https://en.wikipedia.org/api/rest_v1/page/summary';
 const NEWSDATA_BASE = 'https://newsdata.io/api/1/latest';
-const JIKAN_BASE    = 'https://api.jikan.moe/v4';
 const FIREBASE_BASE = 'https://moviesupdate-e2ec9-default-rtdb.firebaseio.com';
 
 const TTL = {
-  query:   604800,
-  news:    3600,
-  session: 7200,
-  chat:    21600,
+  query: 604800,  // 7 days
+  news:  3600,    // 1 hour
 };
 
 const RATE_LIMIT  = 20;
 const RATE_WINDOW = 60;
 
 // ============================================
-// TOOL DEFINITIONS — kept lean, short descriptions
+// TOOL DEFINITIONS — TMDB, Wikipedia, NewsData
+// Jikan removed — was exhausting website rate limit
 // ============================================
-const ALL_TOOLS = {
-  movies: {
+const TOOL_DEFINITIONS = [
+  {
     type: 'function',
     function: {
       name: 'search_movies',
-      description: 'Search movies/TV shows, get recommendations, details, cast, ratings, trending.',
+      description: 'Search for movies or TV shows, get recommendations, find details about cast, ratings, plot, directors, or trending titles. Use for any film, series, or cinema-related query.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Title, genre, actor, or description' },
-          type:  { type: 'string', enum: ['search','recommend','trending','details'] }
+          query: {
+            type: 'string',
+            description: 'Movie title, genre, actor name, director, or descriptive phrase like "mind-bending sci-fi"'
+          },
+          type: {
+            type: 'string',
+            enum: ['search', 'recommend', 'trending', 'details'],
+            description: 'search=find specific title, recommend=similar movies, trending=whats popular now, details=full info on a title'
+          }
         },
-        required: ['query','type']
+        required: ['query', 'type']
       }
     }
   },
-  anime: {
-    type: 'function',
-    function: {
-      name: 'search_anime',
-      description: 'Search anime or manga titles, ratings, recommendations.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string' },
-          type:  { type: 'string', enum: ['anime','manga','recommend'] }
-        },
-        required: ['query','type']
-      }
-    }
-  },
-  news: {
+  {
     type: 'function',
     function: {
       name: 'search_news',
-      description: 'Get latest film/TV news, box office, upcoming releases, industry updates.',
+      description: 'Get the latest film and entertainment news, box office results, upcoming release announcements, awards news, and industry updates.',
       parameters: {
         type: 'object',
         properties: {
-          query:    { type: 'string' },
-          category: { type: 'string', enum: ['hollywood','anime','indian','general'] }
+          query: {
+            type: 'string',
+            description: 'News search term'
+          },
+          category: {
+            type: 'string',
+            enum: ['hollywood', 'anime', 'indian', 'general'],
+            description: 'Category filter for the news'
+          }
         },
-        required: ['query','category']
+        required: ['query', 'category']
       }
     }
   },
-  wikipedia: {
+  {
     type: 'function',
     function: {
       name: 'search_wikipedia',
-      description: 'Get factual background on films, directors, actors, cinema history.',
+      description: 'Get factual background information on films, directors, actors, award ceremonies, or cinema history. Use when user asks "who is", "who was", "tell me about", or needs biographical/historical context.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string' }
+          query: {
+            type: 'string',
+            description: 'Person, film, or topic to look up'
+          }
         },
         required: ['query']
       }
     }
-  },
-  profile: {
-    type: 'function',
-    function: {
-      name: 'get_user_profile',
-      description: 'Get user preferences and liked genres to personalize recommendations.',
-      parameters: {
-        type: 'object',
-        properties: {
-          uid: { type: 'string' }
-        },
-        required: ['uid']
-      }
-    }
   }
-};
+];
 
 // ============================================
-// DYNAMIC TOOL SELECTION
-// Only inject tools relevant to the message
-// Saves 200-400 tokens per request
-// ============================================
-function selectTools(message, uid) {
-  const m = message.toLowerCase();
-  const tools = [];
-
-  // Movie signals
-  const movieSignals = ['movie','film','watch','series','show','actor','director',
-    'recommend','rating','cast','plot','sequel','trilogy','franchise','cinema',
-    'netflix','disney','marvel','dc','horror','action','comedy','drama','thriller',
-    'sci-fi','romance','trending','top','best','worst','classic','blockbuster'];
-
-  // Anime signals
-  const animeSignals = ['anime','manga','manhwa','otaku','crunchyroll','one piece',
-    'naruto','dragon ball','attack on titan','jujutsu','demon slayer'];
-
-  // News signals
-  const newsSignals = ['news','latest','recent','update','release','announced',
-    'upcoming','box office','award','oscar','grammy','trailer','premieres'];
-
-  // Wikipedia signals
-  const wikiSignals = ['who is','who was','biography','history','about','background',
-    'director of','produced by','based on','original','when did','when was'];
-
-  // Chat signals — pure conversation, no tools needed
-  const chatSignals = ['how are you','how\'s it going','hello','hi','hey','thanks',
-    'thank you','bye','goodbye','lol','haha','ok','okay','cool','nice','great',
-    'i feel','i\'m feeling','feeling','mood','emotional','sad','happy','bored',
-    'just finished','just watched','what do you think','your opinion'];
-
-  const isPureChat = chatSignals.some(s => m.includes(s)) &&
-    !movieSignals.some(s => m.includes(s)) &&
-    !animeSignals.some(s => m.includes(s)) &&
-    !newsSignals.some(s => m.includes(s));
-
-  // Pure chat — no tools, saves ~600 tokens
-  if (isPureChat) return [];
-
-  if (movieSignals.some(s => m.includes(s))) tools.push(ALL_TOOLS.movies);
-  if (animeSignals.some(s => m.includes(s))) tools.push(ALL_TOOLS.anime);
-  if (newsSignals.some(s => m.includes(s)))  tools.push(ALL_TOOLS.news);
-  if (wikiSignals.some(s => m.includes(s)))  tools.push(ALL_TOOLS.wikipedia);
-
-  // Default: if no specific signal but not pure chat, include movies
-  if (tools.length === 0) tools.push(ALL_TOOLS.movies);
-
-  // Add profile if we have a uid and there are other tools (personalization)
-  if (uid && tools.length > 0) tools.push(ALL_TOOLS.profile);
-
-  return tools;
-}
-
-// ============================================
-// VALIDATE TOOL CALL ARGUMENTS before execution
-// Catches malformed tool calls before they hit
-// Groq's validator and cause tool_use_failed
+// SCHEMA VALIDATOR — catches malformed tool
+// calls before they hit Groq and cause 400s
 // ============================================
 function validateToolCall(tc) {
   try {
     if (!tc.function?.name) return false;
     if (!tc.function?.arguments) return false;
     const args = JSON.parse(tc.function.arguments);
-    const tool = Object.values(ALL_TOOLS).find(
-      t => t.function.name === tc.function.name
-    );
+    const tool = TOOL_DEFINITIONS.find(t => t.function.name === tc.function.name);
     if (!tool) return false;
     const required = tool.function.parameters.required || [];
-    return required.every(r => args[r] !== undefined && args[r] !== null);
-  } catch {
-    return false;
-  }
+    return required.every(r => args[r] !== undefined && args[r] !== null && args[r] !== '');
+  } catch { return false; }
 }
 
 // ============================================
-// PERSONALITY SYSTEM PROMPT — compressed
+// COMPANION PERSONALITY SYSTEM PROMPT
+// Emotion-first, tool-results are invisible
+// helpers — user only ever sees the friend
 // ============================================
-function buildSystemPrompt(userProfile = null) {
-  const profileContext = userProfile
-    ? `\nUSER PROFILE: liked=${(userProfile.liked_genres||[]).join(',')}, ` +
-      `disliked=${(userProfile.disliked_genres||[]).join(',')}, ` +
-      `recent=${(userProfile.recent_titles||[]).slice(-3).join(',')}`
+function buildSystemPrompt(sessionMemory = null) {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('en-US', {
+    year: 'numeric', month: 'long', day: 'numeric'
+  });
+  const currentYear = now.getFullYear();
+
+  const memoryContext = sessionMemory
+    ? `\nUSER MEMORY (loaded once this session — use naturally, don't reference it directly):
+- Liked genres: ${(sessionMemory.liked_genres || []).join(', ') || 'none yet'}
+- Disliked genres: ${(sessionMemory.disliked_genres || []).join(', ') || 'none'}
+- Recent titles mentioned: ${(sessionMemory.recent_titles || []).slice(-5).join(', ') || 'none'}
+Only use this to lean recommendations naturally. Never say "based on your preferences" or "I see you like X".`
     : '';
 
-  return `You are Clappy, a passionate movie expert and friend. You know every film ever made.
+  return `You are Clappy — a passionate, witty movie companion who happens to know everything about cinema. You feel like that one friend everyone wishes they had: someone who's seen every film ever made, remembers every detail, and makes movie conversations genuinely fun.
 
-BEHAVIOR PRIORITY: Accuracy > Helpfulness > Personality > Creativity.
+TODAY'S DATE: ${dateStr}. Current year: ${currentYear}.
+Your training knowledge is solid up to roughly August 2025. For anything released or announced after that — especially ${currentYear} releases, recent box office, new trailers, casting news — rely on the tool data provided to you. If tool data says something, it's current and correct. Trust it over your training memory.
 
-HARD RULES:
+═══ COMPANION RULES — WHO YOU ARE ═══
+
+You are NOT a search engine with a chatbot interface.
+You are a COMPANION who happens to use search tools silently.
+
+The difference:
+- Search engine: fires tool, dumps results, waits for next query
+- Companion: reacts like a friend, weaves tool data naturally into conversation, has opinions, remembers the thread
+
+CONVERSATION FLOW — CRITICAL:
+- Always read the full conversation context before responding
+- If someone is mid-topic, stay on that topic unless they clearly shift
+- Short casual messages get short warm responses — don't launch into a list when someone says "nice" or "thanks"
+- Match the energy: excited message = energetic response, reflective message = thoughtful response
+- Ask natural follow-up questions the way a friend would, not a customer service bot
+
+REACTION FIRST, INFORMATION SECOND:
+- WRONG: "Here are some horror movies: 🎬 Get Out (2017)..."
+- RIGHT: "If you want something that gets under your skin, Get Out is still one of the best..."
+- WRONG: "Here's info about Interstellar:"
+- RIGHT: "Your boy is onto something — Interstellar hits different because..."
+- WRONG: "I found some news about Marvel:"
+- RIGHT: "Marvel's been busy lately —"
+
+EMOTIONAL INTELLIGENCE:
+- When someone shares a feeling, acknowledge it genuinely FIRST before any movie content
+- "I just finished a movie and I'm emotional" → respond to the emotion, then ask what they watched
+- "I'm bored" → warm response, then offer something
+- Never assume someone wants movie recommendations just because they're feeling something
+- One genuine sentence of empathy goes a long way
+
+OPINIONS — have them:
+- "Is Inception overrated?" → don't just present both sides robotically. Have a take: "Honestly? The people calling it overrated are the same ones who..." 
+- You love cinema. You have favorites. You disagree with critics sometimes. That's what makes you feel real.
+
+═══ HARD RULES — NEVER BREAK ═══
 - NEVER invent movies, actors, directors, ratings, or plot details
-- NEVER output JSON, function call syntax, citation numbers [1][2][cite:], or <function=...> tags
-- Only use facts from tool results — if tools returned nothing, say so honestly
-- Present all knowledge naturally, like a knowledgeable friend
-
-RESPONSE STYLE:
-- React like a friend first, then deliver information
+- NEVER output [cite: ...], [1][2], <function=...>, JSON, or any technical markup
+- NEVER say "my training", "my knowledge cutoff", "I am an AI", "I am a language model"
+- NEVER say "based on your preferences", "I see that you like", "according to my data"
 - NEVER announce what you're about to do — just do it
-- WRONG: "Here are some movie recommendations:" → RIGHT: "If you want thrills tonight, start with..."
-- WRONG: "Here's info about Interstellar:" → RIGHT: "Your boy has a point — Interstellar is Nolan at his peak."
-- If someone says "my boy/friend told me X" — validate or correct naturally, don't recite facts
-- Rewrite ALL tool data as natural speech — never copy-paste raw descriptions
+- If tool data is empty or unavailable, say so honestly in your own voice: "That one's not on my radar yet — might be too recent."
 
 UNRELEASED FILMS:
-- Tool results include released: true/false
-- If released=false, ALWAYS note it's upcoming: "Masters of the Universe (coming July 2026)..."
-- Never present unreleased films the same as released ones
+- Tool results include released: true/false and release_date
+- If released=false, ALWAYS flag it naturally: "Thunderbolts is dropping in May — not out yet but..."
+- Never present an unreleased film as though it's already watchable
 
-RECOMMENDATIONS FORMAT:
+═══ BANNED PHRASES ═══
+"Here are some...", "Here's a look at...", "I found...", "Based on...",
+"I'd be happy to...", "Great question!", "Certainly!", "Absolutely!",
+"my database", "my training", "I should mention", "It's worth noting",
+"Feel free to ask", "Don't hesitate", "I hope that helps"
+
+═══ RECOMMENDATION FORMAT ═══
+When listing films (only when genuinely listing):
 🎬 Title (Year) ⭐ Rating/10
-One punchy sentence why they'll love it
-Always give exactly 5 unless user asks for more or fewer.
+One punchy sentence — what makes this one worth their time specifically
 
-GREETINGS: One warm sentence, one emoji max. "Hey there! 😊 Got a movie in mind, or want to dig into a topic?"
+Give exactly 5 unless asked for more or fewer.
 
-EMOTIONAL SUPPORT: One genuine warm sentence first, then transition to cinema naturally.
-
-BANNED PHRASES: "Here are some...", "I found...", "Based on...", "I'd be happy to...", "Great question!", "my database", "my training"${profileContext}`;
+═══ GREETING ═══
+One sentence, warm, direct. One emoji max.
+"Hey there! 😊 Got a movie in mind, or want to dig into a topic?"
+Vary the wording each time but keep the same energy.${memoryContext}`;
 }
 
 // ============================================
@@ -239,10 +213,8 @@ BANNED PHRASES: "Here are some...", "I found...", "Based on...", "I'd be happy t
 async function executeTool(toolName, args, env) {
   switch (toolName) {
     case 'search_movies':    return await toolMovies(args, env);
-    case 'search_anime':     return await toolAnime(args);
     case 'search_news':      return await toolNews(args, env);
     case 'search_wikipedia': return await toolWikipedia(args);
-    case 'get_user_profile': return await toolUserProfile(args, env);
     default: return { error: 'Unknown tool' };
   }
 }
@@ -252,18 +224,20 @@ async function toolMovies(args, env) {
   const key = env.TMDB_KEY;
   if (!key) return { error: 'TMDB key not configured' };
 
-  const cacheKey = `tmdb_${type}_${query.toLowerCase().replace(/\W+/g,'_')}`;
+  const cacheKey = `tmdb_${type}_${query.toLowerCase().replace(/\W+/g, '_')}`;
   const cached = await cacheGet(cacheKey, env);
   if (cached) return cached;
 
-  let endpoint = '';
   const params = `api_key=${key}&language=en-US`;
   const now = new Date();
+  let endpoint = '';
 
   if (type === 'trending') {
-    endpoint = `/trending/movie/week?${params}`;
+    endpoint = `/trending/all/week?${params}`;
   } else if (type === 'recommend') {
-    const sr = await fetchWithTimeout(`${TMDB_BASE}/search/movie?${params}&query=${encodeURIComponent(query)}`);
+    const sr = await fetchWithTimeout(
+      `${TMDB_BASE}/search/movie?${params}&query=${encodeURIComponent(query)}`
+    );
     const sd = await sr.json();
     const first = sd.results?.[0];
     if (!first) return { results: [], message: 'No matching titles found' };
@@ -275,15 +249,15 @@ async function toolMovies(args, env) {
   const res = await fetchWithTimeout(`${TMDB_BASE}${endpoint}`);
   const data = await res.json();
 
-  // Trim to essential fields only — reduces token payload significantly
   const results = (data.results || []).slice(0, 8).map(m => {
     const releaseDate = m.release_date || m.first_air_date || '';
     return {
       title:        m.title || m.name,
       year:         releaseDate.slice(0, 4),
+      release_date: releaseDate,
       released:     releaseDate ? new Date(releaseDate) <= now : true,
       rating:       m.vote_average?.toFixed(1),
-      overview:     (m.overview || '').slice(0, 150), // trimmed from 200
+      overview:     (m.overview || '').slice(0, 200),
       type:         m.media_type || 'movie'
     };
   });
@@ -293,33 +267,12 @@ async function toolMovies(args, env) {
   return result;
 }
 
-async function toolAnime(args) {
-  const { query, type } = args;
-  let url = type === 'manga'
-    ? `${JIKAN_BASE}/manga?q=${encodeURIComponent(query)}&limit=6&order_by=score&sort=desc`
-    : `${JIKAN_BASE}/anime?q=${encodeURIComponent(query)}&limit=6&order_by=score&sort=desc`;
-
-  const res = await fetchWithTimeout(url);
-  const data = await res.json();
-
-  const results = (data.data || []).slice(0, 5).map(a => ({
-    title:    a.title_english || a.title,
-    year:     a.aired?.prop?.from?.year || a.published?.prop?.from?.year,
-    rating:   a.score,
-    overview: (a.synopsis || '').slice(0, 150),
-    episodes: a.episodes,
-    type:     a.type
-  }));
-
-  return { results, source: 'jikan' };
-}
-
 async function toolNews(args, env) {
   const { query, category } = args;
   const key = env.NEWS_KEY;
   if (!key) return { error: 'NewsData key not configured' };
 
-  const cacheKey = `news_${category}_${query.toLowerCase().replace(/\W+/g,'_')}`;
+  const cacheKey = `news_${category}_${query.toLowerCase().replace(/\W+/g, '_')}`;
   const cached = await cacheGet(cacheKey, env);
   if (cached) return cached;
 
@@ -327,9 +280,9 @@ async function toolNews(args, env) {
   const res = await fetchWithTimeout(url);
   const data = await res.json();
 
-  const results = (data.results || []).slice(0, 4).map(a => ({
+  const results = (data.results || []).slice(0, 5).map(a => ({
     title:       a.title,
-    description: (a.description || '').slice(0, 150),
+    description: (a.description || '').slice(0, 200),
     source:      a.source_id,
     date:        a.pubDate
   }));
@@ -341,25 +294,20 @@ async function toolNews(args, env) {
 
 async function toolWikipedia(args) {
   const { query } = args;
-  const res = await fetchWithTimeout(`${WIKI_BASE}/${encodeURIComponent(query)}`);
+  const res = await fetchWithTimeout(
+    `${WIKI_BASE}/${encodeURIComponent(query)}`
+  );
   if (!res.ok) return { error: 'Not found on Wikipedia' };
   const data = await res.json();
-  const cleanSummary = (data.extract || '')
+  const clean = (data.extract || '')
     .replace(/\[cite:\s*[\d,\s]+\]/g, '')
     .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
-    .slice(0, 400); // trimmed from 500
-  return { title: data.title, summary: cleanSummary, source: 'wikipedia' };
-}
-
-async function toolUserProfile(args, env) {
-  const { uid } = args;
-  if (!uid) return { error: 'No uid provided' };
-  const profile = await firebaseGet(`user_profiles/${uid}`, env);
-  return profile || { uid, liked_genres: [], disliked_genres: [], recent_titles: [] };
+    .slice(0, 450);
+  return { title: data.title, summary: clean, source: 'wikipedia' };
 }
 
 // ============================================
-// FIREBASE CACHE HELPERS
+// FIREBASE CACHE
 // ============================================
 async function cacheGet(key, env) {
   try {
@@ -381,7 +329,7 @@ async function cacheSet(key, value, ttlSeconds, env) {
       result:     value,
       expires_at: Date.now() + (ttlSeconds * 1000)
     }, env);
-  } catch { /* non-critical */ }
+  } catch {}
 }
 
 async function firebaseGet(path, env) {
@@ -396,9 +344,9 @@ async function firebasePut(path, data, env) {
   const token = env.FIREBASE_SECRET;
   const url = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
   return fetchWithTimeout(url, {
-    method: 'PUT',
+    method:  'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data)
+    body:    JSON.stringify(data)
   });
 }
 
@@ -417,13 +365,12 @@ function validateToolResults(toolResults) {
     if (result.error) continue;
     if (result.results?.length > 0) return true;
     if (result.summary) return true;
-    if (result.liked_genres !== undefined) return true;
   }
   return false;
 }
 
 // ============================================
-// CLEAN RESPONSE — strip any leaked artifacts
+// RESPONSE CLEANUP
 // ============================================
 function cleanResponse(text) {
   return (text || '')
@@ -445,25 +392,25 @@ async function geminiFallback(messages, env) {
 
   const prompt = messages
     .filter(m => m.role !== 'system')
-    .slice(-4) // only last 2 turns for fallback — saves tokens
+    .slice(-6)
     .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
     .join('\n');
 
   const res = await fetchWithTimeout(`${GEMINI_URL}?key=${apiKey}`, {
-    method: 'POST',
+    method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       tools: [{ googleSearch: {} }],
-      generationConfig: { temperature: 0.7, maxOutputTokens: 400 }
+      generationConfig: { temperature: 0.75, maxOutputTokens: 500 }
     })
-  }, 15000);
+  }, 18000);
 
   if (!res.ok) throw new Error(`Gemini error: ${res.status}`);
   const data = await res.json();
   return cleanResponse(
     data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    "I couldn't find reliable info on that one."
+    "That one's stumped me — try asking a different way! 🎬"
   );
 }
 
@@ -472,14 +419,18 @@ async function geminiFallback(messages, env) {
 // ============================================
 async function checkRateLimit(ip, env) {
   try {
-    const key = `rate_${ip.replace(/[.:#]/g, '_')}`;
+    const key  = `rate_${ip.replace(/[.:#]/g, '_')}`;
     const data = await firebaseGet(`rate_limits/${key}`, env);
-    const now = Date.now();
+    const now  = Date.now();
     if (data && (now - data.window_start) < (RATE_WINDOW * 1000)) {
       if (data.count >= RATE_LIMIT) return false;
-      firebasePut(`rate_limits/${key}`, { count: data.count + 1, window_start: data.window_start }, env).catch(() => {});
+      firebasePut(`rate_limits/${key}`, {
+        count: data.count + 1, window_start: data.window_start
+      }, env).catch(() => {});
     } else {
-      firebasePut(`rate_limits/${key}`, { count: 1, window_start: now }, env).catch(() => {});
+      firebasePut(`rate_limits/${key}`, {
+        count: 1, window_start: now
+      }, env).catch(() => {});
     }
     return true;
   } catch { return true; }
@@ -518,93 +469,20 @@ function jsonRes(obj, status = 200, origin = null) {
 // ============================================
 // MAIN ORCHESTRATION
 // ============================================
-async function orchestrate(userMessage, uid, conversationHistory, env) {
-  const userProfile = uid ? await toolUserProfile({ uid }, env) : null;
-  const systemPrompt = buildSystemPrompt(userProfile);
-
-  // Dynamic tool selection — only inject relevant tools
-  const selectedTools = selectTools(userMessage, uid);
+async function orchestrate(userMessage, sessionMemory, conversationHistory, env) {
+  const systemPrompt = buildSystemPrompt(sessionMemory);
 
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...conversationHistory.slice(-4), // max 2 prior turns in context
+    ...conversationHistory.slice(-6),
     { role: 'user', content: userMessage }
   ];
 
-  // ── STEP 1: Groq call with dynamically selected tools ──
+  // ── Step 1: Groq with function calling ──
   let groqRes, groqData;
   try {
     groqRes = await fetchWithTimeout(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${env.GROQ_KEY}`
-      },
-      body: JSON.stringify({
-        model:        GROQ_MODEL,
-        messages,
-        tools:        selectedTools.length > 0 ? selectedTools : undefined,
-        tool_choice:  selectedTools.length > 0 ? 'auto' : undefined,
-        max_tokens:   700,
-        temperature:  0.72
-      })
-    }, 15000);
-
-    // Check HTTP status explicitly — catches 400 tool_use_failed
-    if (!groqRes.ok) {
-      const errBody = await groqRes.text().catch(() => '');
-      const isToolFailure = errBody.includes('tool_use_failed');
-
-      if (isToolFailure) {
-        // Retry WITHOUT tools — let model answer from knowledge alone
-        const retryRes = await fetchWithTimeout(GROQ_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type':  'application/json',
-            'Authorization': `Bearer ${env.GROQ_KEY}`
-          },
-          body: JSON.stringify({
-            model:       GROQ_MODEL,
-            messages,
-            max_tokens:  600,
-            temperature: 0.72
-          })
-        }, 12000);
-
-        if (retryRes.ok) {
-          const retryData = await retryRes.json();
-          const retryReply = retryData.choices?.[0]?.message?.content;
-          if (retryReply) return cleanResponse(retryReply);
-        }
-      }
-
-      // Both Groq paths failed — Gemini fallback
-      return await geminiFallback(messages, env);
-    }
-
-    groqData = await groqRes.json();
-  } catch (err) {
-    return await geminiFallback(messages, env);
-  }
-
-  if (groqData.error) {
-    return await geminiFallback(messages, env);
-  }
-
-  const choice = groqData.choices?.[0];
-  const assistantMessage = choice?.message;
-
-  // ── STEP 2: Execute tool calls ──
-  const toolCalls = (assistantMessage?.tool_calls || [])
-    .filter(tc => validateToolCall(tc)); // schema validation before execution
-
-  const invalidCalls = (assistantMessage?.tool_calls || [])
-    .filter(tc => !validateToolCall(tc));
-
-  // If ALL tool calls were invalid — retry without tools
-  if (assistantMessage?.tool_calls?.length > 0 && toolCalls.length === 0) {
-    const retryRes = await fetchWithTimeout(GROQ_URL, {
-      method: 'POST',
+      method:  'POST',
       headers: {
         'Content-Type':  'application/json',
         'Authorization': `Bearer ${env.GROQ_KEY}`
@@ -612,26 +490,86 @@ async function orchestrate(userMessage, uid, conversationHistory, env) {
       body: JSON.stringify({
         model:       GROQ_MODEL,
         messages,
-        max_tokens:  600,
-        temperature: 0.72
+        tools:       TOOL_DEFINITIONS,
+        tool_choice: 'auto',
+        max_tokens:  750,
+        temperature: 0.78
       })
-    }, 12000);
+    }, 15000);
 
-    if (retryRes.ok) {
-      const retryData = await retryRes.json();
-      const retryReply = retryData.choices?.[0]?.message?.content;
-      if (retryReply) return cleanResponse(retryReply);
+    // Catch 400 tool_use_failed explicitly
+    if (!groqRes.ok) {
+      const errText = await groqRes.text().catch(() => '');
+      const isToolFail = errText.includes('tool_use_failed');
+
+      if (isToolFail) {
+        // Retry without tools — model answers from own knowledge
+        const retry = await fetchWithTimeout(GROQ_URL, {
+          method:  'POST',
+          headers: {
+            'Content-Type':  'application/json',
+            'Authorization': `Bearer ${env.GROQ_KEY}`
+          },
+          body: JSON.stringify({
+            model:       GROQ_MODEL,
+            messages,
+            max_tokens:  650,
+            temperature: 0.78
+          })
+        }, 12000);
+
+        if (retry.ok) {
+          const rd = await retry.json();
+          const rr = rd.choices?.[0]?.message?.content;
+          if (rr) return cleanResponse(rr);
+        }
+      }
+      return await geminiFallback(messages, env);
+    }
+
+    groqData = await groqRes.json();
+  } catch {
+    return await geminiFallback(messages, env);
+  }
+
+  if (groqData.error) return await geminiFallback(messages, env);
+
+  const assistantMessage = groqData.choices?.[0]?.message;
+
+  // ── Step 2: Validate and execute tool calls ──
+  const allToolCalls   = assistantMessage?.tool_calls || [];
+  const validToolCalls = allToolCalls.filter(tc => validateToolCall(tc));
+
+  // If model tried tools but ALL were invalid — retry without tools
+  if (allToolCalls.length > 0 && validToolCalls.length === 0) {
+    const retry = await fetchWithTimeout(GROQ_URL, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${env.GROQ_KEY}`
+      },
+      body: JSON.stringify({
+        model:       GROQ_MODEL,
+        messages,
+        max_tokens:  650,
+        temperature: 0.78
+      })
+    }, 12000).catch(() => null);
+
+    if (retry?.ok) {
+      const rd = await retry.json();
+      const rr = rd.choices?.[0]?.message?.content;
+      if (rr) return cleanResponse(rr);
     }
     return await geminiFallback(messages, env);
   }
 
-  let toolResults = [];
-
-  if (toolCalls.length > 0) {
-    toolResults = await Promise.all(
-      toolCalls.map(async (tc) => {
+  if (validToolCalls.length > 0) {
+    // Execute all valid tools in parallel
+    const toolResults = await Promise.all(
+      validToolCalls.map(async tc => {
         try {
-          const args = JSON.parse(tc.function.arguments);
+          const args   = JSON.parse(tc.function.arguments);
           const result = await executeTool(tc.function.name, args, env);
           return {
             tool_call_id: tc.id,
@@ -650,17 +588,17 @@ async function orchestrate(userMessage, uid, conversationHistory, env) {
       })
     );
 
-    // ── STEP 3: Validate tool results ──
-    const parsedResults = toolResults.map(t => {
+    // ── Step 3: Validate tool results ──
+    const parsed = toolResults.map(t => {
       try { return JSON.parse(t.content); } catch { return {}; }
     });
 
-    if (!validateToolResults(parsedResults)) {
+    if (!validateToolResults(parsed)) {
       try   { return await geminiFallback(messages, env); }
-      catch { return "I couldn't find reliable info on that one. Try rephrasing! 🎬"; }
+      catch { return "That one's not coming through clearly — try asking a different way! 🎬"; }
     }
 
-    // ── STEP 4: Final generation ──
+    // ── Step 4: Final generation with tool data ──
     const finalMessages = [
       ...messages,
       assistantMessage,
@@ -670,7 +608,7 @@ async function orchestrate(userMessage, uid, conversationHistory, env) {
     let finalRes, finalData;
     try {
       finalRes = await fetchWithTimeout(GROQ_URL, {
-        method: 'POST',
+        method:  'POST',
         headers: {
           'Content-Type':  'application/json',
           'Authorization': `Bearer ${env.GROQ_KEY}`
@@ -678,8 +616,8 @@ async function orchestrate(userMessage, uid, conversationHistory, env) {
         body: JSON.stringify({
           model:       GROQ_MODEL,
           messages:    finalMessages,
-          max_tokens:  700,
-          temperature: 0.72
+          max_tokens:  750,
+          temperature: 0.78
         })
       }, 15000);
 
@@ -693,54 +631,14 @@ async function orchestrate(userMessage, uid, conversationHistory, env) {
       return await geminiFallback(messages, env);
     }
 
-    const reply = cleanResponse(finalData.choices[0].message.content);
-
-    // Update user profile in background
-    if (uid) updateUserProfile(uid, userMessage, reply, env).catch(() => {});
-
-    return reply;
+    return cleanResponse(finalData.choices[0].message.content);
   }
 
-  // ── Direct conversational reply (no tools needed) ──
-  const directReply = assistantMessage?.content;
-  if (directReply) return cleanResponse(directReply);
+  // ── Direct reply — no tools needed ──
+  const direct = assistantMessage?.content;
+  if (direct) return cleanResponse(direct);
 
   return await geminiFallback(messages, env);
-}
-
-// ============================================
-// USER PROFILE UPDATER
-// ============================================
-async function updateUserProfile(uid, userMessage, reply, env) {
-  try {
-    const existing = await firebaseGet(`user_profiles/${uid}`, env) || {
-      liked_genres: [], disliked_genres: [], recent_titles: [],
-      tone_preference: 'default', last_seen: null
-    };
-
-    const msg = userMessage.toLowerCase();
-    const likedWords    = ['love','like','enjoy','favorite','great','best','amazing'];
-    const dislikedWords = ['hate','dislike',"don't like",'boring','terrible','worst'];
-    const genres = ['action','horror','comedy','drama','sci-fi','thriller',
-                    'romance','animation','documentary','fantasy','anime','indian'];
-
-    for (const genre of genres) {
-      if (!msg.includes(genre)) continue;
-      if (likedWords.some(w => msg.includes(w)) && !existing.liked_genres.includes(genre)) {
-        existing.liked_genres.push(genre);
-      }
-      if (dislikedWords.some(w => msg.includes(w)) && !existing.disliked_genres.includes(genre)) {
-        existing.disliked_genres.push(genre);
-      }
-    }
-
-    existing.last_seen = Date.now();
-    if (existing.liked_genres.length    > 10) existing.liked_genres    = existing.liked_genres.slice(-10);
-    if (existing.disliked_genres.length > 10) existing.disliked_genres = existing.disliked_genres.slice(-10);
-    if (existing.recent_titles.length   > 10) existing.recent_titles   = existing.recent_titles.slice(-10);
-
-    await firebasePut(`user_profiles/${uid}`, existing, env);
-  } catch { /* non-critical */ }
 }
 
 // ============================================
@@ -757,7 +655,7 @@ export default {
     }
 
     if (request.method === 'GET' && url.pathname === '/') {
-      return jsonRes({ status: 'Clappy Orchestrator v4.2 🎬' }, 200, origin);
+      return jsonRes({ status: 'Clappy Companion v4.3 🎬' }, 200, origin);
     }
 
     if (request.method === 'POST' && url.pathname === '/') {
@@ -765,13 +663,15 @@ export default {
 
       const ip      = request.headers.get('CF-Connecting-IP') || 'unknown';
       const allowed = await checkRateLimit(ip, env);
-      if (!allowed) return jsonRes({ error: 'Too many requests. Slow down.' }, 429, origin);
+      if (!allowed) {
+        return jsonRes({ error: 'Too many requests. Slow down.' }, 429, origin);
+      }
 
       let body;
       try { body = await request.json(); }
       catch { return jsonRes({ error: 'Invalid request body' }, 400, origin); }
 
-      const { messages, uid } = body;
+      const { messages, sessionMemory } = body;
       if (!messages || !Array.isArray(messages)) {
         return jsonRes({ error: 'messages array required' }, 400, origin);
       }
@@ -784,11 +684,13 @@ export default {
       }));
 
       try {
-        const reply = await orchestrate(userMessage, uid, history, env);
+        const reply = await orchestrate(
+          userMessage, sessionMemory || null, history, env
+        );
         return jsonRes({ reply }, 200, origin);
       } catch {
         return jsonRes({
-          reply: "Something went wrong on my end. Give it another shot! 🎬"
+          reply: "Something went sideways on my end — give it another shot! 🎬"
         }, 200, origin);
       }
     }

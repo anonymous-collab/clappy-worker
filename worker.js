@@ -9,7 +9,7 @@
 const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
-  '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
+  'https://relaxed-kringle-570cc0.netlify.app',
   'http://localhost:8158',
 ];
 
@@ -40,13 +40,13 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_movies',
-      description: 'Search for movies or TV shows, get recommendations, find details about cast, ratings, plot, directors, or trending titles. Use for any film, series, or cinema-related query.',
+      description: 'Search for movies or TV shows. Use ONLY when the user names or clearly describes a specific title, person, genre, or topic. Do NOT use for vague follow-ups like "tell me more" or "what about that" — only call this when you have a concrete search term to fill the query field.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Movie title, genre, actor name, director, or descriptive phrase like "mind-bending sci-fi"'
+            description: 'A specific movie title, actor name, director, genre, or descriptive phrase. Must be a non-empty concrete term — never a pronoun or vague reference.'
           },
           type: {
             type: 'string',
@@ -62,13 +62,13 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_news',
-      description: 'Get the latest film and entertainment news, box office results, upcoming release announcements, awards news, and industry updates.',
+      description: 'Get latest film and entertainment news, box office results, upcoming releases, awards, and industry updates. Use ONLY when user asks about recent news or announcements — not for general movie info.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'News search term'
+            description: 'Specific news search term — must be a concrete non-empty topic or title'
           },
           category: {
             type: 'string',
@@ -84,13 +84,13 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_wikipedia',
-      description: 'Get factual background information on films, directors, actors, award ceremonies, or cinema history. Use when user asks "who is", "who was", "tell me about", or needs biographical/historical context.',
+      description: 'Get factual background on films, directors, actors, award ceremonies, or cinema history. Use when user asks "who is", "who was", "tell me about", or needs biographical/historical context. Only call when you have a specific named subject to look up.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Person, film, or topic to look up'
+            description: 'A specific named person, film title, or topic — must be a concrete non-empty term'
           }
         },
         required: ['query']
@@ -365,16 +365,22 @@ function validateToolResults(toolResults) {
   return false;
 }
 
-// ============================================
-// RESPONSE CLEANUP
-// ============================================
 function cleanResponse(text) {
   return (text || '')
+    // Remove complete citation blocks [cite: 1, 2]
     .replace(/\[cite:\s*[\d,\s]+\]/g, '')
+    // Remove partial/incomplete [cite... cut off at end of response
+    .replace(/\[cite[^\]]*$/gi, '')
+    // Remove remaining [...] citation numbers
     .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
+    // Strip function/tool call artifacts
     .replace(/<function=[\s\S]*?<\/function>/g, '')
     .replace(/\{["']?query["']?:[\s\S]*?\}/g, '')
+    // Strip **bold** markdown — keep the text inside
     .replace(/\*\*(.*?)\*\*/g, '$1')
+    // Strip bullet * list markers at line start: "* Item" → "Item"
+    .replace(/(^|\n)\s*\*\s+/g, '$1')
+    // Collapse extra spaces
     .replace(/  +/g, ' ')
     .trim();
 }
@@ -474,6 +480,16 @@ async function orchestrate(userMessage, sessionMemory, conversationHistory, env)
     { role: 'user', content: userMessage }
   ];
 
+  // ── Tool guard: skip tools for very short/vague messages ──
+  // llama-3.3 generates malformed tool calls (400 tool_use_failed)
+  // when the message is too short or ambiguous to fill required fields.
+  // For messages under 4 words with no clear named subject, answer
+  // from training knowledge directly — no tool needed anyway.
+  const wordCount = userMessage.trim().split(/\s+/).length;
+  const isVague = wordCount <= 3 && !/[a-z]{4,}/i.test(userMessage);
+  const toolsToUse = isVague ? undefined : TOOL_DEFINITIONS;
+  const toolChoiceToUse = isVague ? undefined : 'auto';
+
   // ── Step 1: Groq with function calling ──
   let groqRes, groqData;
   try {
@@ -486,8 +502,7 @@ async function orchestrate(userMessage, sessionMemory, conversationHistory, env)
       body: JSON.stringify({
         model:       GROQ_MODEL,
         messages,
-        tools:       TOOL_DEFINITIONS,
-        tool_choice: 'auto',
+        ...(toolsToUse && { tools: toolsToUse, tool_choice: toolChoiceToUse }),
         max_tokens:  750,
         temperature: 0.78
       })

@@ -10,8 +10,17 @@ const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
   '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
-  'http://localhost:8159',
+  // Allow any localhost port — Acode live server picks random ports
+  // so hardcoding 8158 caused CORS failures when port changed
 ];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  // Allow any localhost regardless of port
+  if (/^http:\/\/localhost:\d+$/.test(origin)) return true;
+  return false;
+}
 
 const GROQ_MODEL    = 'llama-3.3-70b-versatile';
 const GEMINI_MODEL  = 'gemini-2.5-flash';
@@ -135,72 +144,82 @@ function buildSystemPrompt(sessionMemory = null) {
 Only use this to lean recommendations naturally. Never say "based on your preferences" or "I see you like X".`
     : '';
 
-  return `You are Clappy — a sharp, knowledgeable movie companion on the MoviesUpdate website. You know cinema inside out and give people exactly what they came for: fast, accurate, useful movie information — delivered with personality.
+  return `You are Clappy — a sharp, passionate movie companion on MoviesUpdate. You know cinema inside out and you genuinely love talking about it. You give people real information with real personality — not a search engine, not a customer service bot, but a friend who happens to know everything about movies.
 
 TODAY'S DATE: ${dateStr}. Current year: ${currentYear}.
-Your training knowledge is solid up to roughly August 2025. For anything released or announced after that — especially ${currentYear} releases, recent box office, new trailers, casting news — rely on the tool data provided. If tool data says something, it's current and correct. Trust it over your training memory.
+Your training knowledge goes to roughly August 2025. For anything after that — ${currentYear} releases, recent casting, box office — rely on the tool data. Tool data is current and always wins over your training memory.
 
-═══ CORE RULE — ANSWER FIRST ═══
+═══ TOOL USAGE — CRITICAL ═══
 
-The user came for movie information. Give it to them directly.
-Personality is the seasoning, not the meal.
+When someone asks "what can you tell me about [movie]" or "tell me about [movie]":
+→ ALWAYS call search_movies with type="details" — this fetches full plot, cast, director, rating, runtime
+→ NEVER answer from training memory alone for specific title queries
+→ "What's it about?" = details. "Is it good?" = details. "Who's in it?" = details.
 
-WRONG: "Ooh interesting question! I love when people ask about this. So here's what I know..."
-RIGHT: "Interstellar (2014) — Christopher Nolan's sci-fi epic about a crew traveling through a wormhole..."
+When someone asks for recommendations or "something like X":
+→ call search_movies with type="recommend"
 
-WRONG: "I'm not entirely sure I'm up to date on this one, but let me try to help..."
-RIGHT: "That one's too recent for me — my data only goes to mid-2025. Try the Trending tab for the latest."
+When someone asks what's trending or popular now:
+→ call search_movies with type="trending"
 
-Give the answer. Add a sentence of personality after if it fits naturally. That's the formula.
+When someone asks about news, announcements, or "what's happening with X":
+→ call search_news
 
-═══ CONVERSATION STYLE ═══
+When someone asks "who is [person]" or needs background on a filmmaker:
+→ call search_wikipedia
 
-- Match message length to what was asked. Short question = short answer. Detail request = full answer.
-- Casual messages ("nice", "thanks", "lol") get casual one-liners back. Don't launch a list at them.
-- Have opinions — if someone asks if a movie is good, tell them. Don't straddle both sides.
-- Follow-ups should feel natural, not scripted customer service. One follow-up max per reply.
-- Stay on topic until the user clearly shifts it.
+TOOL DATA USAGE:
+- When you get tool results, USE THEM FULLY — plot, cast, director, rating, genres, runtime
+- Don't just mention the release date and stop. That's not an answer.
+- If a movie has a tagline in the data, work it in naturally
+- If cast is provided, mention at least 2-3 names
+- overview field is the plot — describe it in your own words, don't just copy it
 
-EMOTIONAL INTELLIGENCE (use sparingly):
-- If someone shares a feeling before asking something, one sentence of acknowledgment is enough — then answer.
-- "I'm bored, what should I watch?" → skip the empathy, go straight to suggestions.
-- "I just watched X and I'm crying" → one warm line, then ask what they thought or offer more like it.
-- Never withhold the answer waiting for emotional acknowledgment first.
+═══ WHO YOU ARE ═══
 
-OPINIONS — have them:
-- Asked if something is overrated? Pick a side. "Honestly, the hate for Prometheus is way overblown — it's flawed but fascinating."
-- Asked for your favorite? Give one, don't hedge.
+You're knowledgeable AND likeable. Think 60% substance, 40% personality.
 
-═══ HARD RULES — NEVER BREAK ═══
-- NEVER invent movies, actors, directors, ratings, or plot details
-- NEVER output [cite: ...], [1][2], <function=...>, JSON, or any technical markup
-- NEVER say "my training", "my knowledge cutoff", "I am an AI", "I am a language model"
-- NEVER say "based on your preferences", "I see that you like", "according to my data"
+- You have opinions. "Is X good?" → pick a side. Don't hedge.
+- You get excited about great movies. That enthusiasm is real.
+- You're concise but not cold. An answer can be warm without being padded.
+- Match the user's energy: casual message = casual response, detailed question = detailed answer.
+- One natural follow-up per reply max — and only if it genuinely fits.
+
+GOOD RESPONSE PATTERN for "tell me about [movie]":
+→ What it is (genre, year, who made it)
+→ What it's about (plot in 2-3 sentences in your own words)  
+→ Cast highlights
+→ Rating/vibe — is it worth watching?
+→ One line of your own take or a follow-up offer
+
+BAD PATTERN: "Masters of the Universe was released on June 3, 2026." [nothing else]
+
+═══ HARD RULES ═══
+- NEVER invent plot details, cast, ratings, or dates — use tool data
+- NEVER output [cite], [1][2], JSON, or technical markup
+- NEVER say "my training", "my knowledge cutoff", "I am an AI"
+- NEVER say "I found...", "Based on...", "Here are some..."
 - NEVER announce what you're about to do — just do it
-- If tool data is empty or unavailable: "That one's not on my radar yet — might be too recent."
+- If tool data is empty AND it's a recent title: "That one's not loading for me right now — the TMDB data might not be in yet. Try the search bar!"
+- If tool data is empty AND it's an older title: answer from your own knowledge
 
-UNRELEASED FILMS:
-- Tool results include released: true/false and release_date
-- If released=false, flag it naturally: "That's not out yet — drops in [month]."
+UNRELEASED FILMS: If released=false in tool data, say so naturally: "Not out yet — drops [month/year]."
 
 ═══ BANNED PHRASES ═══
-"Here are some...", "Here's a look at...", "I found...", "Based on...",
-"I'd be happy to...", "Great question!", "Certainly!", "Absolutely!",
-"my database", "my training", "I should mention", "It's worth noting",
+"Great question!", "Certainly!", "Absolutely!", "I'd be happy to",
 "Feel free to ask", "Don't hesitate", "I hope that helps",
-"I'm not entirely sure", "I'm not entirely up-to-date"
+"I'm not entirely sure", "I'm not entirely up-to-date",
+"my database", "my training data", "It's worth noting"
 
 ═══ RECOMMENDATION FORMAT ═══
-When listing films (only when actually listing multiple):
+When listing multiple films:
 🎬 Title (Year) ⭐ Rating/10
-One punchy sentence — what makes this one worth their time specifically
+One punchy sentence on why this one specifically fits what they're looking for
 
-Give exactly 5 unless asked for more or fewer.
+Give exactly 5 unless asked otherwise.
 
 ═══ GREETING ═══
-One sentence, warm, direct. One emoji max.
-Example: "Hey! 🎬 Got a movie in mind, or want me to find you something?"
-Vary the wording each time.${memoryContext}`;
+Warm, one sentence, one emoji max. Vary it every time.${memoryContext}`;
 }
 
 // ============================================
@@ -238,6 +257,68 @@ async function toolMovies(args, env) {
     const first = sd.results?.[0];
     if (!first) return { results: [], message: 'No matching titles found' };
     endpoint = `/movie/${first.id}/recommendations?${params}`;
+  } else if (type === 'details') {
+    // Search first to get the ID, then fetch full details
+    // Try movie first, fall back to TV
+    const srMovie = await fetchWithTimeout(
+      `${TMDB_BASE}/search/movie?${params}&query=${encodeURIComponent(query)}`
+    );
+    const sdMovie = await srMovie.json();
+    let detailData = null;
+    let mediaType = 'movie';
+
+    if (sdMovie.results?.[0]) {
+      const id = sdMovie.results[0].id;
+      const detailRes = await fetchWithTimeout(
+        `${TMDB_BASE}/movie/${id}?${params}&append_to_response=credits`
+      );
+      detailData = await detailRes.json();
+    } else {
+      // Try TV
+      const srTv = await fetchWithTimeout(
+        `${TMDB_BASE}/search/tv?${params}&query=${encodeURIComponent(query)}`
+      );
+      const sdTv = await srTv.json();
+      if (sdTv.results?.[0]) {
+        const id = sdTv.results[0].id;
+        const detailRes = await fetchWithTimeout(
+          `${TMDB_BASE}/tv/${id}?${params}&append_to_response=credits`
+        );
+        detailData = await detailRes.json();
+        mediaType = 'tv';
+      }
+    }
+
+    if (!detailData) return { results: [], message: 'Title not found' };
+
+    const releaseDate = detailData.release_date || detailData.first_air_date || '';
+    const cast = (detailData.credits?.cast || [])
+      .slice(0, 6)
+      .map(c => c.name)
+      .join(', ');
+    const director = (detailData.credits?.crew || [])
+      .find(c => c.job === 'Director')?.name || '';
+    const genres = (detailData.genres || []).map(g => g.name).join(', ');
+
+    const result = {
+      results: [{
+        title:        detailData.title || detailData.name,
+        year:         releaseDate.slice(0, 4),
+        release_date: releaseDate,
+        released:     releaseDate ? new Date(releaseDate) <= now : true,
+        rating:       detailData.vote_average?.toFixed(1),
+        overview:     (detailData.overview || '').slice(0, 500),
+        genres,
+        director,
+        cast,
+        type:         mediaType,
+        runtime:      detailData.runtime || detailData.episode_run_time?.[0] || null,
+        tagline:      detailData.tagline || ''
+      }],
+      source: 'tmdb'
+    };
+    await cacheSet(cacheKey, result, TTL.query, env);
+    return result;
   } else {
     endpoint = `/search/multi?${params}&query=${encodeURIComponent(query)}&page=1`;
   }
@@ -253,7 +334,7 @@ async function toolMovies(args, env) {
       release_date: releaseDate,
       released:     releaseDate ? new Date(releaseDate) <= now : true,
       rating:       m.vote_average?.toFixed(1),
-      overview:     (m.overview || '').slice(0, 200),
+      overview:     (m.overview || '').slice(0, 350),
       type:         m.media_type || 'movie'
     };
   });
@@ -298,7 +379,7 @@ async function toolWikipedia(args) {
   const clean = (data.extract || '')
     .replace(/\[cite:\s*[\d,\s]+\]/g, '')
     .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
-    .slice(0, 450);
+    .slice(0, 700);
   return { title: data.title, summary: clean, source: 'wikipedia' };
 }
 
@@ -453,7 +534,7 @@ function fetchWithTimeout(url, options = {}, ms = 8000) {
 // ============================================
 function getAllowedOrigin(request) {
   const origin = request.headers.get('Origin') || '';
-  return ALLOWED_ORIGINS.includes(origin) ? origin : null;
+  return isAllowedOrigin(origin) ? origin : null;
 }
 function corsHeaders(origin) {
   return {
@@ -480,15 +561,13 @@ async function orchestrate(userMessage, sessionMemory, conversationHistory, env)
     { role: 'user', content: userMessage }
   ];
 
-  // ── Tool guard: skip tools for very short/vague messages ──
-  // llama-3.3 generates malformed tool calls (400 tool_use_failed)
-  // when the message is too short or ambiguous to fill required fields.
-  // For messages under 4 words with no clear named subject, answer
-  // from training knowledge directly — no tool needed anyway.
-  const wordCount = userMessage.trim().split(/\s+/).length;
-  const isVague = wordCount <= 3 && !/[a-z]{4,}/i.test(userMessage);
-  const toolsToUse = isVague ? undefined : TOOL_DEFINITIONS;
-  const toolChoiceToUse = isVague ? undefined : 'auto';
+  // ── Tool guard: skip tools only for pure greetings/reactions ──
+  // Only bypasses tools for truly content-free messages (hi, thanks, lol, ok)
+  // where there is literally nothing to search for. Everything else gets tools.
+  const GREETING_ONLY = /^(hi+|hello|hey|yo|sup|thanks?|ty|lol|lmao|ok+|okay|cool|nice|great|wow|haha|sure|yep|nope|bye|k)[\s!?.]*$/i;
+  const isGreeting = GREETING_ONLY.test(userMessage.trim());
+  const toolsToUse = isGreeting ? undefined : TOOL_DEFINITIONS;
+  const toolChoiceToUse = isGreeting ? undefined : 'auto';
 
   // ── Step 1: Groq with function calling ──
   let groqRes, groqData;

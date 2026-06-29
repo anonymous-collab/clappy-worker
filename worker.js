@@ -10,7 +10,7 @@ const ALLOWED_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
   '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
-  'http://localhost:8158',
+  'http://localhost:8159',
 ];
 
 const GROQ_MODEL    = 'llama-3.3-70b-versatile';

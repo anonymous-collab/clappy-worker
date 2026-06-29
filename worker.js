@@ -1,66 +1,84 @@
 // ============================================
-// CLAPPY WORKER v4.3 — Companion Edition
-// llama-3.3-70b-versatile (function calling)
-// Gemini 2.5 Flash fallback
-// Tools: TMDB, Wikipedia, NewsData
-// Memory: localStorage (loaded once per session)
+// CLAPPY WORKER v5.0
+// Model: llama-3.3-70b-versatile (Groq)
+// Fallback: Gemini 2.5 Flash (live search)
+// Tools: TMDB (movies/TV), Wikipedia, NewsData
 // ============================================
 
-const ALLOWED_ORIGINS = [
+// ── Allowed origins ──────────────────────────
+const PRODUCTION_ORIGINS = [
   'https://moviesupdate.online',
   'https://www.moviesupdate.online',
-  '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
-  // Allow any localhost port — Acode live server picks random ports
-  // so hardcoding 8158 caused CORS failures when port changed
+  'https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
 ];
 
 function isAllowedOrigin(origin) {
   if (!origin) return false;
-  if (ALLOWED_ORIGINS.includes(origin)) return true;
-  // Allow any localhost regardless of port
+  if (PRODUCTION_ORIGINS.includes(origin)) return true;
+  // Any localhost port is fine for local dev (Acode changes port each session)
   if (/^http:\/\/localhost:\d+$/.test(origin)) return true;
   return false;
 }
 
-const GROQ_MODEL    = 'llama-3.3-70b-versatile';
-const GEMINI_MODEL  = 'gemini-2.5-flash';
-const GEMINI_URL    = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// ── API constants ─────────────────────────────
 const GROQ_URL      = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL    = 'llama-3.3-70b-versatile';
+const GEMINI_URL    = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 const TMDB_BASE     = 'https://api.themoviedb.org/3';
-const TMDB_IMG      = 'https://image.tmdb.org/t/p/w500';
-const WIKI_BASE     = 'https://en.wikipedia.org/api/rest_v1/page/summary';
-const NEWSDATA_BASE = 'https://newsdata.io/api/1/latest';
+const WIKI_URL      = 'https://en.wikipedia.org/api/rest_v1/page/summary';
+const NEWS_URL      = 'https://newsdata.io/api/1/latest';
 const FIREBASE_BASE = 'https://moviesupdate-e2ec9-default-rtdb.firebaseio.com';
 
-const TTL = {
-  query: 604800,  // 7 days
-  news:  3600,    // 1 hour
-};
+// ── Cache TTLs (seconds) ──────────────────────
+// Details: 1 day — recent films update frequently on TMDB
+// News: 1 hour — must stay fresh
+// Search/recommend/trending: 3 days
+const TTL_DETAIL   = 86400;
+const TTL_NEWS     = 3600;
+const TTL_GENERAL  = 259200;
 
-const RATE_LIMIT  = 20;
-const RATE_WINDOW = 60;
+// ── Rate limit ────────────────────────────────
+const RATE_MAX    = 20;   // requests
+const RATE_WINDOW = 60;   // seconds
 
 // ============================================
-// TOOL DEFINITIONS — TMDB, Wikipedia, NewsData
-// Jikan removed — was exhausting website rate limit
+// TOOL DEFINITIONS
+//
+// IMPORTANT DESIGN NOTES:
+// - "details" is the correct type for ANY query
+//   asking about a specific title. The model must
+//   use details, not search, for "tell me about X".
+// - Tool descriptions are the model's instructions.
+//   They must be unambiguous and leave no room for
+//   the model to choose the wrong type.
+// - search_wikipedia is complementary to search_movies
+//   for biographical or historical context.
 // ============================================
-const TOOL_DEFINITIONS = [
+const TOOLS = [
   {
     type: 'function',
     function: {
       name: 'search_movies',
-      description: 'Search for movies or TV shows. Use ONLY when the user names or clearly describes a specific title, person, genre, or topic. Do NOT use for vague follow-ups like "tell me more" or "what about that" — only call this when you have a concrete search term to fill the query field.',
+      description: `Search TMDB for movie and TV show data.
+
+TYPE SELECTION — pick exactly one:
+• "details" → Use when the user asks about a SPECIFIC title: "what is X about", "tell me about X", "who is in X", "is X good", "when did X come out", "X review". This returns full plot, cast, director, genres, runtime, rating.
+• "search"  → Use when the user mentions a title but wants a quick lookup or you are not sure it exists yet.
+• "recommend" → Use when the user wants movies similar to a title they mention.
+• "trending" → Use when the user asks what is popular, trending, or new right now.
+
+NEVER use "search" when "details" is appropriate. If the user is asking about a specific known title, always use "details".`,
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'A specific movie title, actor name, director, genre, or descriptive phrase. Must be a non-empty concrete term — never a pronoun or vague reference.'
+            description: 'The movie or TV show title, actor, director, or genre. Must be a real concrete term — not a pronoun like "it" or "that".'
           },
           type: {
             type: 'string',
-            enum: ['search', 'recommend', 'trending', 'details'],
-            description: 'search=find specific title, recommend=similar movies, trending=whats popular now, details=full info on a title'
+            enum: ['details', 'search', 'recommend', 'trending'],
+            description: 'The query type. See tool description for which to use.'
           }
         },
         required: ['query', 'type']
@@ -71,18 +89,18 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_news',
-      description: 'Get latest film and entertainment news, box office results, upcoming releases, awards, and industry updates. Use ONLY when user asks about recent news or announcements — not for general movie info.',
+      description: 'Get latest entertainment news, box office results, release announcements, casting news, and awards coverage. Use when the user asks about recent news, what is happening with a film or person, or industry updates.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Specific news search term — must be a concrete non-empty topic or title'
+            description: 'The news search topic — a title, person, or event. Must be specific and non-empty.'
           },
           category: {
             type: 'string',
             enum: ['hollywood', 'anime', 'indian', 'general'],
-            description: 'Category filter for the news'
+            description: 'Entertainment category to search within.'
           }
         },
         required: ['query', 'category']
@@ -93,13 +111,13 @@ const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'search_wikipedia',
-      description: 'Get factual background on films, directors, actors, award ceremonies, or cinema history. Use when user asks "who is", "who was", "tell me about", or needs biographical/historical context. Only call when you have a specific named subject to look up.',
+      description: 'Get biographical or historical background on a filmmaker, actor, franchise, or film movement. Use when the user asks "who is", "who was", "tell me about [person]", or needs context beyond what TMDB provides.',
       parameters: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'A specific named person, film title, or topic — must be a concrete non-empty term'
+            description: 'Person, film, or topic to look up. Must be a specific named subject.'
           }
         },
         required: ['query']
@@ -109,278 +127,228 @@ const TOOL_DEFINITIONS = [
 ];
 
 // ============================================
-// SCHEMA VALIDATOR — catches malformed tool
-// calls before they hit Groq and cause 400s
+// SYSTEM PROMPT
 // ============================================
-function validateToolCall(tc) {
-  try {
-    if (!tc.function?.name) return false;
-    if (!tc.function?.arguments) return false;
-    const args = JSON.parse(tc.function.arguments);
-    const tool = TOOL_DEFINITIONS.find(t => t.function.name === tc.function.name);
-    if (!tool) return false;
-    const required = tool.function.parameters.required || [];
-    return required.every(r => args[r] !== undefined && args[r] !== null && args[r] !== '');
-  } catch { return false; }
-}
-
-// ============================================
-// COMPANION PERSONALITY SYSTEM PROMPT
-// Emotion-first, tool-results are invisible
-// helpers — user only ever sees the friend
-// ============================================
-function buildSystemPrompt(sessionMemory = null) {
-  const now = new Date();
-  const dateStr = now.toLocaleDateString('en-US', {
-    year: 'numeric', month: 'long', day: 'numeric'
-  });
+function buildSystemPrompt(sessionMemory) {
+  const now         = new Date();
+  const dateStr     = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const currentYear = now.getFullYear();
 
-  const memoryContext = sessionMemory
-    ? `\nUSER MEMORY (loaded once this session — use naturally, don't reference it directly):
-- Liked genres: ${(sessionMemory.liked_genres || []).join(', ') || 'none yet'}
+  const memoryBlock = sessionMemory
+    ? `\n\nUSER SESSION CONTEXT (use naturally — never say "I see you like" or "based on your preferences"):
+- Liked genres: ${(sessionMemory.liked_genres || []).join(', ') || 'none recorded'}
 - Disliked genres: ${(sessionMemory.disliked_genres || []).join(', ') || 'none'}
-- Recent titles mentioned: ${(sessionMemory.recent_titles || []).slice(-5).join(', ') || 'none'}
-Only use this to lean recommendations naturally. Never say "based on your preferences" or "I see you like X".`
+- Recently mentioned: ${(sessionMemory.recent_titles || []).slice(-5).join(', ') || 'none'}`
     : '';
 
-  return `You are Clappy — a sharp, passionate movie companion on MoviesUpdate. You know cinema inside out and you genuinely love talking about it. You give people real information with real personality — not a search engine, not a customer service bot, but a friend who happens to know everything about movies.
+  return `You are Clappy — a knowledgeable, passionate movie companion on MoviesUpdate. Think of yourself as that friend who has seen everything, remembers everything, and makes talking about movies genuinely enjoyable.
 
-TODAY'S DATE: ${dateStr}. Current year: ${currentYear}.
-Your training knowledge goes to roughly August 2025. For anything after that — ${currentYear} releases, recent casting, box office — rely on the tool data. Tool data is current and always wins over your training memory.
+TODAY: ${dateStr} | CURRENT YEAR: ${currentYear}
+Your training knowledge ends around August 2025. For anything after that — ${currentYear} releases, recent news, new casting — the tool data you receive is the source of truth. Always trust tool data over your memory.
 
-═══ TOOL USAGE — CRITICAL ═══
+━━━ HOW TO USE TOOLS ━━━
 
-When someone asks "what can you tell me about [movie]" or "tell me about [movie]":
-→ ALWAYS call search_movies with type="details" — this fetches full plot, cast, director, rating, runtime
-→ NEVER answer from training memory alone for specific title queries
-→ "What's it about?" = details. "Is it good?" = details. "Who's in it?" = details.
+You have three tools. Use them silently — never announce that you are about to search or that you are looking something up. The user asked a question; answer it.
 
-When someone asks for recommendations or "something like X":
-→ call search_movies with type="recommend"
+RULE: For any query about a specific movie or TV show title, call search_movies with type="details". This is the most important rule. "Tell me about X", "what is X about", "who is in X", "is X good", "when does X come out" — all of these are "details" queries.
 
-When someone asks what's trending or popular now:
-→ call search_movies with type="trending"
+RULE: NEVER answer a specific title query from memory alone if you can call the tool. Your memory can be wrong (wrong cast, wrong plot, wrong dates). The tool data is accurate.
 
-When someone asks about news, announcements, or "what's happening with X":
-→ call search_news
+RULE: After getting tool results, use ALL the relevant data. If you received overview, cast, director, genres, runtime — work them into your response naturally. Do not just read back the release date and stop.
 
-When someone asks "who is [person]" or needs background on a filmmaker:
-→ call search_wikipedia
+RULE: If tool results come back empty and the title is recent (post-2025), say something like: "My data on that one is still loading in — try the search bar for the latest." If it is an older title with empty results, you may answer from your training knowledge but flag that it might not be fully accurate.
 
-TOOL DATA USAGE:
-- When you get tool results, USE THEM FULLY — plot, cast, director, rating, genres, runtime
-- Don't just mention the release date and stop. That's not an answer.
-- If a movie has a tagline in the data, work it in naturally
-- If cast is provided, mention at least 2-3 names
-- overview field is the plot — describe it in your own words, don't just copy it
+━━━ HOW TO RESPOND ━━━
 
-═══ WHO YOU ARE ═══
+When answering a "tell me about [movie]" query, your response should naturally cover:
+1. What kind of film it is (genre, year, director if notable)
+2. What it is actually about — describe the plot in 2-3 sentences in your own words
+3. Key cast — mention at least 2-3 names if available
+4. Whether it is worth watching — give a real opinion using the rating as one signal
+5. Optionally: one follow-up offer ("Want recommendations in the same vein?")
 
-You're knowledgeable AND likeable. Think 60% substance, 40% personality.
+Personality balance: you are warm and enthusiastic about cinema, but the substance always comes first. Never pad a response with filler before getting to the point. Never pad with filler after the point has been made.
 
-- You have opinions. "Is X good?" → pick a side. Don't hedge.
-- You get excited about great movies. That enthusiasm is real.
-- You're concise but not cold. An answer can be warm without being padded.
-- Match the user's energy: casual message = casual response, detailed question = detailed answer.
-- One natural follow-up per reply max — and only if it genuinely fits.
+━━━ HARD RULES ━━━
 
-GOOD RESPONSE PATTERN for "tell me about [movie]":
-→ What it is (genre, year, who made it)
-→ What it's about (plot in 2-3 sentences in your own words)  
-→ Cast highlights
-→ Rating/vibe — is it worth watching?
-→ One line of your own take or a follow-up offer
+NEVER do any of these:
+• Invent cast, plot details, directors, or ratings that were not in tool data
+• Say "Let me check that", "Let me look that up", "I'm on it", or any variation — just answer
+• Output [cite], [1], JSON, markdown bold (**), or any technical markup
+• Say "my training data", "my knowledge cutoff", "as an AI", "I am a language model"
+• Say "I found...", "Based on...", "Here are some...", "Great question!", "Certainly!"
+• Say "Feel free to ask", "Don't hesitate", "I hope that helps"
+• Ask more than one follow-up question per reply
 
-BAD PATTERN: "Masters of the Universe was released on June 3, 2026." [nothing else]
+UNRELEASED FILMS: If tool data shows released=false, say so naturally: "It is not out yet — scheduled for [date/month]."
 
-═══ HARD RULES ═══
-- NEVER invent plot details, cast, ratings, or dates — use tool data
-- NEVER output [cite], [1][2], JSON, or technical markup
-- NEVER say "my training", "my knowledge cutoff", "I am an AI"
-- NEVER say "I found...", "Based on...", "Here are some..."
-- NEVER announce what you're about to do — just do it
-- If tool data is empty AND it's a recent title: "That one's not loading for me right now — the TMDB data might not be in yet. Try the search bar!"
-- If tool data is empty AND it's an older title: answer from your own knowledge
-
-UNRELEASED FILMS: If released=false in tool data, say so naturally: "Not out yet — drops [month/year]."
-
-═══ BANNED PHRASES ═══
-"Great question!", "Certainly!", "Absolutely!", "I'd be happy to",
-"Feel free to ask", "Don't hesitate", "I hope that helps",
-"I'm not entirely sure", "I'm not entirely up-to-date",
-"my database", "my training data", "It's worth noting"
-
-═══ RECOMMENDATION FORMAT ═══
-When listing multiple films:
+━━━ RECOMMENDATION FORMAT ━━━
+When listing multiple films (only when actually listing):
 🎬 Title (Year) ⭐ Rating/10
-One punchy sentence on why this one specifically fits what they're looking for
+One sentence — what makes this one the right pick for what they asked
 
-Give exactly 5 unless asked otherwise.
+Give exactly 5 unless asked for more or fewer.
 
-═══ GREETING ═══
-Warm, one sentence, one emoji max. Vary it every time.${memoryContext}`;
+━━━ GREETING ━━━
+One warm sentence, one emoji max. Vary the wording every time. Never start with "Hey there!" — be more creative.${memoryBlock}`;
 }
 
 // ============================================
 // TOOL EXECUTORS
 // ============================================
-async function executeTool(toolName, args, env) {
-  switch (toolName) {
-    case 'search_movies':    return await toolMovies(args, env);
-    case 'search_news':      return await toolNews(args, env);
-    case 'search_wikipedia': return await toolWikipedia(args);
-    default: return { error: 'Unknown tool' };
-  }
+async function executeTool(name, args, env) {
+  if (name === 'search_movies')    return toolMovies(args, env);
+  if (name === 'search_news')      return toolNews(args, env);
+  if (name === 'search_wikipedia') return toolWikipedia(args);
+  return { error: 'Unknown tool: ' + name };
 }
 
+// ── TMDB ─────────────────────────────────────
 async function toolMovies(args, env) {
   const { query, type } = args;
-  const key = env.TMDB_KEY;
-  if (!key) return { error: 'TMDB key not configured' };
+  if (!env.TMDB_KEY) return { error: 'TMDB key not configured' };
 
-  const cacheKey = `tmdb_${type}_${query.toLowerCase().replace(/\W+/g, '_')}`;
-  const cached = await cacheGet(cacheKey, env);
+  const cacheKey = `v5_tmdb_${type}_${query.toLowerCase().replace(/\W+/g, '_')}`;
+  const cached   = await cacheGet(cacheKey, env);
   if (cached) return cached;
 
-  const params = `api_key=${key}&language=en-US`;
+  const p   = `api_key=${env.TMDB_KEY}&language=en-US`;
   const now = new Date();
-  let endpoint = '';
 
-  if (type === 'trending') {
-    endpoint = `/trending/all/week?${params}`;
-  } else if (type === 'recommend') {
-    const sr = await fetchWithTimeout(
-      `${TMDB_BASE}/search/movie?${params}&query=${encodeURIComponent(query)}`
-    );
-    const sd = await sr.json();
-    const first = sd.results?.[0];
-    if (!first) return { results: [], message: 'No matching titles found' };
-    endpoint = `/movie/${first.id}/recommendations?${params}`;
-  } else if (type === 'details') {
-    // Search first to get the ID, then fetch full details
-    // Try movie first, fall back to TV
-    const srMovie = await fetchWithTimeout(
-      `${TMDB_BASE}/search/movie?${params}&query=${encodeURIComponent(query)}`
-    );
-    const sdMovie = await srMovie.json();
+  // ── DETAILS: full movie/TV info with cast ──
+  if (type === 'details') {
+    // Try movie search first, then TV
     let detailData = null;
-    let mediaType = 'movie';
+    let mediaType  = 'movie';
 
-    if (sdMovie.results?.[0]) {
-      const id = sdMovie.results[0].id;
-      const detailRes = await fetchWithTimeout(
-        `${TMDB_BASE}/movie/${id}?${params}&append_to_response=credits`
-      );
-      detailData = await detailRes.json();
-    } else {
-      // Try TV
-      const srTv = await fetchWithTimeout(
-        `${TMDB_BASE}/search/tv?${params}&query=${encodeURIComponent(query)}`
-      );
-      const sdTv = await srTv.json();
-      if (sdTv.results?.[0]) {
-        const id = sdTv.results[0].id;
-        const detailRes = await fetchWithTimeout(
-          `${TMDB_BASE}/tv/${id}?${params}&append_to_response=credits`
-        );
-        detailData = await detailRes.json();
-        mediaType = 'tv';
+    const movieSearch = await safeFetch(`${TMDB_BASE}/search/movie?${p}&query=${enc(query)}`);
+    if (movieSearch?.results?.[0]) {
+      const id   = movieSearch.results[0].id;
+      detailData = await safeFetch(`${TMDB_BASE}/movie/${id}?${p}&append_to_response=credits`);
+      mediaType  = 'movie';
+    }
+
+    if (!detailData?.id) {
+      const tvSearch = await safeFetch(`${TMDB_BASE}/search/tv?${p}&query=${enc(query)}`);
+      if (tvSearch?.results?.[0]) {
+        const id   = tvSearch.results[0].id;
+        detailData = await safeFetch(`${TMDB_BASE}/tv/${id}?${p}&append_to_response=credits`);
+        mediaType  = 'tv';
       }
     }
 
-    if (!detailData) return { results: [], message: 'Title not found' };
+    if (!detailData?.id) return { results: [], source: 'tmdb', message: 'Title not found on TMDB' };
 
     const releaseDate = detailData.release_date || detailData.first_air_date || '';
-    const cast = (detailData.credits?.cast || [])
-      .slice(0, 6)
-      .map(c => c.name)
-      .join(', ');
-    const director = (detailData.credits?.crew || [])
-      .find(c => c.job === 'Director')?.name || '';
-    const genres = (detailData.genres || []).map(g => g.name).join(', ');
+    const cast        = (detailData.credits?.cast  || []).slice(0, 7).map(c => c.name).join(', ');
+    const director    = (detailData.credits?.crew  || []).find(c => c.job === 'Director')?.name || '';
+    const genres      = (detailData.genres         || []).map(g => g.name).join(', ');
+    const creators    = (detailData.created_by     || []).map(c => c.name).join(', ');
 
     const result = {
       results: [{
-        title:        detailData.title || detailData.name,
+        title:        detailData.title || detailData.name || '',
         year:         releaseDate.slice(0, 4),
         release_date: releaseDate,
         released:     releaseDate ? new Date(releaseDate) <= now : true,
-        rating:       detailData.vote_average?.toFixed(1),
-        overview:     (detailData.overview || '').slice(0, 500),
+        rating:       detailData.vote_average ? Number(detailData.vote_average).toFixed(1) : null,
+        vote_count:   detailData.vote_count || 0,
+        overview:     (detailData.overview   || '').slice(0, 600),
+        tagline:      detailData.tagline     || '',
         genres,
-        director,
+        director:     director || creators,
         cast,
-        type:         mediaType,
         runtime:      detailData.runtime || detailData.episode_run_time?.[0] || null,
-        tagline:      detailData.tagline || ''
+        type:         mediaType,
+        status:       detailData.status || '',
       }],
       source: 'tmdb'
     };
-    await cacheSet(cacheKey, result, TTL.query, env);
+
+    await cacheSet(cacheKey, result, TTL_DETAIL, env);
     return result;
-  } else {
-    endpoint = `/search/multi?${params}&query=${encodeURIComponent(query)}&page=1`;
   }
 
-  const res = await fetchWithTimeout(`${TMDB_BASE}${endpoint}`);
-  const data = await res.json();
+  // ── TRENDING ──────────────────────────────
+  if (type === 'trending') {
+    const data = await safeFetch(`${TMDB_BASE}/trending/all/week?${p}`);
+    const results = buildBasicResults(data?.results || [], now);
+    const result  = { results, source: 'tmdb' };
+    await cacheSet(cacheKey, result, TTL_GENERAL, env);
+    return result;
+  }
 
-  const results = (data.results || []).slice(0, 8).map(m => {
-    const releaseDate = m.release_date || m.first_air_date || '';
+  // ── RECOMMEND ─────────────────────────────
+  if (type === 'recommend') {
+    const search = await safeFetch(`${TMDB_BASE}/search/movie?${p}&query=${enc(query)}`);
+    const first  = search?.results?.[0];
+    if (!first) return { results: [], source: 'tmdb', message: 'No matching title found for recommendations' };
+
+    const data    = await safeFetch(`${TMDB_BASE}/movie/${first.id}/recommendations?${p}`);
+    const results = buildBasicResults(data?.results || [], now);
+    const result  = { results, source: 'tmdb' };
+    await cacheSet(cacheKey, result, TTL_GENERAL, env);
+    return result;
+  }
+
+  // ── SEARCH (general) ─────────────────────
+  const data    = await safeFetch(`${TMDB_BASE}/search/multi?${p}&query=${enc(query)}`);
+  const results = buildBasicResults(data?.results || [], now);
+  const result  = { results, source: 'tmdb' };
+  await cacheSet(cacheKey, result, TTL_GENERAL, env);
+  return result;
+}
+
+function buildBasicResults(items, now) {
+  return items.slice(0, 8).map(m => {
+    const rd = m.release_date || m.first_air_date || '';
     return {
-      title:        m.title || m.name,
-      year:         releaseDate.slice(0, 4),
-      release_date: releaseDate,
-      released:     releaseDate ? new Date(releaseDate) <= now : true,
-      rating:       m.vote_average?.toFixed(1),
-      overview:     (m.overview || '').slice(0, 350),
+      title:        m.title || m.name || '',
+      year:         rd.slice(0, 4),
+      release_date: rd,
+      released:     rd ? new Date(rd) <= now : true,
+      rating:       m.vote_average ? Number(m.vote_average).toFixed(1) : null,
+      overview:     (m.overview || '').slice(0, 300),
       type:         m.media_type || 'movie'
     };
   });
-
-  const result = { results, source: 'tmdb' };
-  await cacheSet(cacheKey, result, TTL.query, env);
-  return result;
 }
 
+// ── NewsData ─────────────────────────────────
 async function toolNews(args, env) {
   const { query, category } = args;
-  const key = env.NEWS_KEY;
-  if (!key) return { error: 'NewsData key not configured' };
+  if (!env.NEWS_KEY) return { error: 'NewsData key not configured' };
 
-  const cacheKey = `news_${category}_${query.toLowerCase().replace(/\W+/g, '_')}`;
-  const cached = await cacheGet(cacheKey, env);
+  const cacheKey = `v5_news_${category}_${query.toLowerCase().replace(/\W+/g, '_')}`;
+  const cached   = await cacheGet(cacheKey, env);
   if (cached) return cached;
 
-  const url = `${NEWSDATA_BASE}?apikey=${key}&q=${encodeURIComponent(query)}&language=en&category=entertainment`;
-  const res = await fetchWithTimeout(url);
-  const data = await res.json();
+  const url  = `${NEWS_URL}?apikey=${env.NEWS_KEY}&q=${enc(query)}&language=en&category=entertainment`;
+  const data = await safeFetch(url);
 
-  const results = (data.results || []).slice(0, 5).map(a => ({
-    title:       a.title,
-    description: (a.description || '').slice(0, 200),
-    source:      a.source_id,
-    date:        a.pubDate
+  const results = (data?.results || []).slice(0, 5).map(a => ({
+    title:       a.title       || '',
+    description: (a.description || '').slice(0, 250),
+    source:      a.source_id   || '',
+    date:        a.pubDate     || ''
   }));
 
   const result = { results, source: 'newsdata' };
-  await cacheSet(cacheKey, result, TTL.news, env);
+  await cacheSet(cacheKey, result, TTL_NEWS, env);
   return result;
 }
 
+// ── Wikipedia ────────────────────────────────
 async function toolWikipedia(args) {
   const { query } = args;
-  const res = await fetchWithTimeout(
-    `${WIKI_BASE}/${encodeURIComponent(query)}`
-  );
-  if (!res.ok) return { error: 'Not found on Wikipedia' };
-  const data = await res.json();
-  const clean = (data.extract || '')
-    .replace(/\[cite:\s*[\d,\s]+\]/g, '')
-    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
-    .slice(0, 700);
-  return { title: data.title, summary: clean, source: 'wikipedia' };
+  const data = await safeFetch(`${WIKI_URL}/${enc(query)}`);
+  if (!data?.extract) return { error: 'Not found on Wikipedia', source: 'wikipedia' };
+
+  const summary = (data.extract || '')
+    .replace(/\[\d+\]/g, '')
+    .slice(0, 800);
+
+  return { title: data.title || query, summary, source: 'wikipedia' };
 }
 
 // ============================================
@@ -389,13 +357,13 @@ async function toolWikipedia(args) {
 async function cacheGet(key, env) {
   try {
     const safeKey = key.replace(/[.#$/\[\]]/g, '_');
-    const data = await firebaseGet(`query_cache/${safeKey}`, env);
+    const data    = await firebaseGet(`query_cache/${safeKey}`, env);
     if (!data) return null;
     if (data.expires_at && Date.now() > data.expires_at) {
       firebaseDelete(`query_cache/${safeKey}`, env).catch(() => {});
       return null;
     }
-    return data.result;
+    return data.value;
   } catch { return null; }
 }
 
@@ -403,24 +371,24 @@ async function cacheSet(key, value, ttlSeconds, env) {
   try {
     const safeKey = key.replace(/[.#$/\[\]]/g, '_');
     await firebasePut(`query_cache/${safeKey}`, {
-      result:     value,
+      value,
       expires_at: Date.now() + (ttlSeconds * 1000)
     }, env);
-  } catch {}
+  } catch { /* non-fatal — continue without caching */ }
 }
 
 async function firebaseGet(path, env) {
   const token = env.FIREBASE_SECRET;
-  const url = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
-  const res = await fetchWithTimeout(url);
-  if (!res.ok) return null;
+  const url   = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
+  const res   = await safeFetchRaw(url);
+  if (!res?.ok) return null;
   return res.json();
 }
 
 async function firebasePut(path, data, env) {
   const token = env.FIREBASE_SECRET;
-  const url = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
-  return fetchWithTimeout(url, {
+  const url   = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
+  return safeFetchRaw(url, {
     method:  'PUT',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify(data)
@@ -429,72 +397,8 @@ async function firebasePut(path, data, env) {
 
 async function firebaseDelete(path, env) {
   const token = env.FIREBASE_SECRET;
-  const url = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
-  return fetchWithTimeout(url, { method: 'DELETE' });
-}
-
-// ============================================
-// VALIDATION
-// ============================================
-function validateToolResults(toolResults) {
-  if (!toolResults || toolResults.length === 0) return false;
-  for (const result of toolResults) {
-    if (result.error) continue;
-    if (result.results?.length > 0) return true;
-    if (result.summary) return true;
-  }
-  return false;
-}
-
-function cleanResponse(text) {
-  return (text || '')
-    // Remove complete citation blocks [cite: 1, 2]
-    .replace(/\[cite:\s*[\d,\s]+\]/g, '')
-    // Remove partial/incomplete [cite... cut off at end of response
-    .replace(/\[cite[^\]]*$/gi, '')
-    // Remove remaining [...] citation numbers
-    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
-    // Strip function/tool call artifacts
-    .replace(/<function=[\s\S]*?<\/function>/g, '')
-    .replace(/\{["']?query["']?:[\s\S]*?\}/g, '')
-    // Strip **bold** markdown — keep the text inside
-    .replace(/\*\*(.*?)\*\*/g, '$1')
-    // Strip bullet * list markers at line start: "* Item" → "Item"
-    .replace(/(^|\n)\s*\*\s+/g, '$1')
-    // Collapse extra spaces
-    .replace(/  +/g, ' ')
-    .trim();
-}
-
-// ============================================
-// GEMINI FALLBACK
-// ============================================
-async function geminiFallback(messages, env) {
-  const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('Gemini key not set');
-
-  const prompt = messages
-    .filter(m => m.role !== 'system')
-    .slice(-6)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-    .join('\n');
-
-  const res = await fetchWithTimeout(`${GEMINI_URL}?key=${apiKey}`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      tools: [{ googleSearch: {} }],
-      generationConfig: { temperature: 0.75, maxOutputTokens: 500 }
-    })
-  }, 18000);
-
-  if (!res.ok) throw new Error(`Gemini error: ${res.status}`);
-  const data = await res.json();
-  return cleanResponse(
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    "That one's stumped me — try asking a different way! 🎬"
-  );
+  const url   = `${FIREBASE_BASE}/${path}.json${token ? `?auth=${token}` : ''}`;
+  return safeFetchRaw(url, { method: 'DELETE' });
 }
 
 // ============================================
@@ -505,8 +409,9 @@ async function checkRateLimit(ip, env) {
     const key  = `rate_${ip.replace(/[.:#]/g, '_')}`;
     const data = await firebaseGet(`rate_limits/${key}`, env);
     const now  = Date.now();
+
     if (data && (now - data.window_start) < (RATE_WINDOW * 1000)) {
-      if (data.count >= RATE_LIMIT) return false;
+      if (data.count >= RATE_MAX) return false;
       firebasePut(`rate_limits/${key}`, {
         count: data.count + 1, window_start: data.window_start
       }, env).catch(() => {});
@@ -516,26 +421,319 @@ async function checkRateLimit(ip, env) {
       }, env).catch(() => {});
     }
     return true;
-  } catch { return true; }
+  } catch { return true; /* fail open */ }
 }
 
 // ============================================
-// FETCH WITH TIMEOUT
+// FETCH HELPERS
 // ============================================
-function fetchWithTimeout(url, options = {}, ms = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(timer));
+
+// Returns parsed JSON or null — never throws
+async function safeFetch(url, options = {}) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return res.json();
+  } catch { return null; }
+}
+
+// Returns raw Response or null — never throws
+async function safeFetchRaw(url, options = {}) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch { return null; }
+}
+
+// Groq/Gemini need longer timeouts (LLM latency)
+async function llmFetch(url, options = {}) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch { return null; }
+}
+
+function enc(str) { return encodeURIComponent(str); }
+
+// ============================================
+// RESPONSE CLEANUP
+// Strips markdown/citation artifacts that
+// sometimes leak through from the LLM output
+// ============================================
+function cleanResponse(text) {
+  if (!text) return '';
+  return text
+    // Complete citation blocks e.g. [cite: 1, 2]
+    .replace(/\[cite:\s*[\d,\s]+\]/gi, '')
+    // Partial/truncated [cite at end of response
+    .replace(/\[cite[^\]]*$/gi, '')
+    // Numeric citations [1] [2,3]
+    .replace(/\[\d+(?:,\s*\d+)*\]/g, '')
+    // Tool call artifacts
+    .replace(/<function[\s\S]*?<\/function>/gi, '')
+    .replace(/\{["']?(?:query|function)["']?:[\s\S]*?\}/g, '')
+    // Bold markdown **text** → text
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    // Bullet * at start of line → remove marker only
+    .replace(/(^|\n)\s*\*\s+/g, '$1')
+    // Collapse extra whitespace
+    .replace(/  +/g, ' ')
+    .trim();
 }
 
 // ============================================
-// CORS
+// GEMINI FALLBACK
+// Used when Groq fails, tool results are empty,
+// or a tool_use_failed 400 is returned.
+// Gemini has live Google Search — good for
+// very recent titles Groq doesn't know about.
+// ============================================
+async function geminiFallback(messages, env) {
+  if (!env.GEMINI_API_KEY) {
+    return "Something went sideways — give it another shot! 🎬";
+  }
+
+  // Build a readable prompt from the conversation
+  const prompt = messages
+    .filter(m => m.role !== 'system')
+    .slice(-6)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+    .join('\n');
+
+  const res = await llmFetch(`${GEMINI_URL}?key=${env.GEMINI_API_KEY}`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      tools: [{ googleSearch: {} }],
+      generationConfig: { temperature: 0.7, maxOutputTokens: 600 }
+    })
+  });
+
+  if (!res?.ok) return "Something went sideways — give it another shot! 🎬";
+
+  const data = await res.json().catch(() => null);
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return cleanResponse(text) || "Something went sideways — give it another shot! 🎬";
+}
+
+// ============================================
+// TOOL CALL VALIDATOR
+// Checks that the model filled all required
+// fields before we attempt to execute the tool.
+// Malformed calls cause 400s from Groq.
+// ============================================
+function validateToolCall(tc) {
+  try {
+    if (!tc?.function?.name)      return false;
+    if (!tc?.function?.arguments) return false;
+    const args    = JSON.parse(tc.function.arguments);
+    const toolDef = TOOLS.find(t => t.function.name === tc.function.name);
+    if (!toolDef) return false;
+    const required = toolDef.function.parameters.required || [];
+    return required.every(r => args[r] !== undefined && args[r] !== null && String(args[r]).trim() !== '');
+  } catch { return false; }
+}
+
+// ============================================
+// TOOL RESULT VALIDATOR
+// Checks that at least one tool returned
+// useful data before we pass it to the LLM.
+// ============================================
+function hasUsefulResults(toolResults) {
+  for (const r of toolResults) {
+    try {
+      const parsed = typeof r === 'string' ? JSON.parse(r) : r;
+      if (parsed.error) continue;
+      if (Array.isArray(parsed.results) && parsed.results.length > 0) return true;
+      if (parsed.summary) return true;
+    } catch { continue; }
+  }
+  return false;
+}
+
+// ============================================
+// PURE GREETING DETECTOR
+// Only messages that are literally just a
+// greeting with zero content skip tool calls.
+// Everything else — including "hi, tell me
+// about X" — gets tools.
+// ============================================
+const PURE_GREETING = /^(hi+|hello|hey|yo|sup|hiya|greetings|howdy|thanks?|thank\s*you|ty|thx|lol|lmao|haha|ok+|okay|cool|nice|great|wow|sure|yep|nope|bye|cya|k|👍|🙏|😊)[\s!?.]*$/i;
+
+function isPureGreeting(msg) {
+  return PURE_GREETING.test(msg.trim());
+}
+
+// ============================================
+// GROQ API CALLER
+// Shared helper to keep orchestrate() clean.
+// Returns { ok, data, error }
+// ============================================
+async function callGroq(body, env) {
+  const res = await llmFetch(GROQ_URL, {
+    method:  'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${env.GROQ_KEY}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res) return { ok: false, error: 'network' };
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    return { ok: false, error: text.includes('tool_use_failed') ? 'tool_fail' : 'http', status: res.status, text };
+  }
+
+  const data = await res.json().catch(() => null);
+  if (!data) return { ok: false, error: 'parse' };
+
+  return { ok: true, data };
+}
+
+// ============================================
+// MAIN ORCHESTRATION
+//
+// Flow:
+// 1. Send message to Groq with tools available
+// 2a. If Groq returns tool calls → validate → execute → send results back → get final answer
+// 2b. If Groq returns direct text → return it
+// 3. On any Groq failure → Gemini fallback
+// ============================================
+async function orchestrate(userMessage, sessionMemory, history, env) {
+  const systemPrompt = buildSystemPrompt(sessionMemory);
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.slice(-6),
+    { role: 'user', content: userMessage }
+  ];
+
+  const useTools     = !isPureGreeting(userMessage);
+  const toolPayload  = useTools ? { tools: TOOLS, tool_choice: 'auto' } : {};
+
+  // ── Step 1: Initial Groq call ────────────
+  const step1 = await callGroq({
+    model:       GROQ_MODEL,
+    messages,
+    max_tokens:  800,
+    temperature: 0.72,
+    ...toolPayload
+  }, env);
+
+  // If Groq failed entirely → Gemini
+  if (!step1.ok) {
+    // On tool_use_failed, retry without tools before falling to Gemini
+    if (step1.error === 'tool_fail') {
+      const retry = await callGroq({
+        model: GROQ_MODEL, messages, max_tokens: 700, temperature: 0.72
+      }, env);
+      if (retry.ok) {
+        const text = retry.data.choices?.[0]?.message?.content;
+        if (text) return cleanResponse(text);
+      }
+    }
+    return geminiFallback(messages, env);
+  }
+
+  const assistantMsg = step1.data.choices?.[0]?.message;
+  if (!assistantMsg) return geminiFallback(messages, env);
+
+  const allCalls   = assistantMsg.tool_calls || [];
+  const validCalls = allCalls.filter(validateToolCall);
+
+  // ── No tool calls → direct reply ─────────
+  if (validCalls.length === 0) {
+    // If model tried tools but ALL were invalid → retry without tools
+    if (allCalls.length > 0) {
+      const retry = await callGroq({
+        model: GROQ_MODEL, messages, max_tokens: 700, temperature: 0.72
+      }, env);
+      if (retry.ok) {
+        const text = retry.data.choices?.[0]?.message?.content;
+        if (text) return cleanResponse(text);
+      }
+      return geminiFallback(messages, env);
+    }
+
+    // Genuine direct reply
+    const direct = assistantMsg.content;
+    if (direct) return cleanResponse(direct);
+    return geminiFallback(messages, env);
+  }
+
+  // ── Step 2: Execute valid tool calls ─────
+  const toolResults = await Promise.all(validCalls.map(async tc => {
+    try {
+      const args   = JSON.parse(tc.function.arguments);
+      const result = await executeTool(tc.function.name, args, env);
+      return {
+        tool_call_id: tc.id,
+        role:         'tool',
+        name:         tc.function.name,
+        content:      JSON.stringify(result)
+      };
+    } catch (err) {
+      return {
+        tool_call_id: tc.id,
+        role:         'tool',
+        name:         tc.function.name,
+        content:      JSON.stringify({ error: err.message || 'Tool execution failed' })
+      };
+    }
+  }));
+
+  // Check if tool results are useful
+  const parsedResults = toolResults.map(r => {
+    try { return JSON.parse(r.content); } catch { return {}; }
+  });
+
+  if (!hasUsefulResults(parsedResults)) {
+    // Tools returned nothing useful — fall to Gemini (has live search)
+    return geminiFallback(messages, env);
+  }
+
+  // ── Step 3: Final Groq call with tool data
+  const finalMessages = [
+    ...messages,
+    assistantMsg,
+    ...toolResults
+  ];
+
+  const step3 = await callGroq({
+    model:       GROQ_MODEL,
+    messages:    finalMessages,
+    max_tokens:  800,
+    temperature: 0.72
+  }, env);
+
+  if (!step3.ok) return geminiFallback(messages, env);
+
+  const finalText = step3.data.choices?.[0]?.message?.content;
+  if (!finalText)  return geminiFallback(messages, env);
+
+  return cleanResponse(finalText);
+}
+
+// ============================================
+// CORS HELPERS
 // ============================================
 function getAllowedOrigin(request) {
   const origin = request.headers.get('Origin') || '';
   return isAllowedOrigin(origin) ? origin : null;
 }
+
 function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin':  origin,
@@ -543,240 +741,63 @@ function corsHeaders(origin) {
     'Access-Control-Allow-Headers': 'Content-Type',
   };
 }
-function jsonRes(obj, status = 200, origin = null) {
+
+function jsonRes(data, status = 200, origin = null) {
   const headers = { 'Content-Type': 'application/json' };
   if (origin) Object.assign(headers, corsHeaders(origin));
-  return new Response(JSON.stringify(obj), { status, headers });
+  return new Response(JSON.stringify(data), { status, headers });
 }
 
 // ============================================
-// MAIN ORCHESTRATION
-// ============================================
-async function orchestrate(userMessage, sessionMemory, conversationHistory, env) {
-  const systemPrompt = buildSystemPrompt(sessionMemory);
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...conversationHistory.slice(-6),
-    { role: 'user', content: userMessage }
-  ];
-
-  // ── Tool guard: skip tools only for pure greetings/reactions ──
-  // Only bypasses tools for truly content-free messages (hi, thanks, lol, ok)
-  // where there is literally nothing to search for. Everything else gets tools.
-  const GREETING_ONLY = /^(hi+|hello|hey|yo|sup|thanks?|ty|lol|lmao|ok+|okay|cool|nice|great|wow|haha|sure|yep|nope|bye|k)[\s!?.]*$/i;
-  const isGreeting = GREETING_ONLY.test(userMessage.trim());
-  const toolsToUse = isGreeting ? undefined : TOOL_DEFINITIONS;
-  const toolChoiceToUse = isGreeting ? undefined : 'auto';
-
-  // ── Step 1: Groq with function calling ──
-  let groqRes, groqData;
-  try {
-    groqRes = await fetchWithTimeout(GROQ_URL, {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${env.GROQ_KEY}`
-      },
-      body: JSON.stringify({
-        model:       GROQ_MODEL,
-        messages,
-        ...(toolsToUse && { tools: toolsToUse, tool_choice: toolChoiceToUse }),
-        max_tokens:  750,
-        temperature: 0.78
-      })
-    }, 15000);
-
-    // Catch 400 tool_use_failed explicitly
-    if (!groqRes.ok) {
-      const errText = await groqRes.text().catch(() => '');
-      const isToolFail = errText.includes('tool_use_failed');
-
-      if (isToolFail) {
-        // Retry without tools — model answers from own knowledge
-        const retry = await fetchWithTimeout(GROQ_URL, {
-          method:  'POST',
-          headers: {
-            'Content-Type':  'application/json',
-            'Authorization': `Bearer ${env.GROQ_KEY}`
-          },
-          body: JSON.stringify({
-            model:       GROQ_MODEL,
-            messages,
-            max_tokens:  650,
-            temperature: 0.78
-          })
-        }, 12000);
-
-        if (retry.ok) {
-          const rd = await retry.json();
-          const rr = rd.choices?.[0]?.message?.content;
-          if (rr) return cleanResponse(rr);
-        }
-      }
-      return await geminiFallback(messages, env);
-    }
-
-    groqData = await groqRes.json();
-  } catch {
-    return await geminiFallback(messages, env);
-  }
-
-  if (groqData.error) return await geminiFallback(messages, env);
-
-  const assistantMessage = groqData.choices?.[0]?.message;
-
-  // ── Step 2: Validate and execute tool calls ──
-  const allToolCalls   = assistantMessage?.tool_calls || [];
-  const validToolCalls = allToolCalls.filter(tc => validateToolCall(tc));
-
-  // If model tried tools but ALL were invalid — retry without tools
-  if (allToolCalls.length > 0 && validToolCalls.length === 0) {
-    const retry = await fetchWithTimeout(GROQ_URL, {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': `Bearer ${env.GROQ_KEY}`
-      },
-      body: JSON.stringify({
-        model:       GROQ_MODEL,
-        messages,
-        max_tokens:  650,
-        temperature: 0.78
-      })
-    }, 12000).catch(() => null);
-
-    if (retry?.ok) {
-      const rd = await retry.json();
-      const rr = rd.choices?.[0]?.message?.content;
-      if (rr) return cleanResponse(rr);
-    }
-    return await geminiFallback(messages, env);
-  }
-
-  if (validToolCalls.length > 0) {
-    // Execute all valid tools in parallel
-    const toolResults = await Promise.all(
-      validToolCalls.map(async tc => {
-        try {
-          const args   = JSON.parse(tc.function.arguments);
-          const result = await executeTool(tc.function.name, args, env);
-          return {
-            tool_call_id: tc.id,
-            role:         'tool',
-            name:         tc.function.name,
-            content:      JSON.stringify(result)
-          };
-        } catch (err) {
-          return {
-            tool_call_id: tc.id,
-            role:         'tool',
-            name:         tc.function.name,
-            content:      JSON.stringify({ error: err.message })
-          };
-        }
-      })
-    );
-
-    // ── Step 3: Validate tool results ──
-    const parsed = toolResults.map(t => {
-      try { return JSON.parse(t.content); } catch { return {}; }
-    });
-
-    if (!validateToolResults(parsed)) {
-      try   { return await geminiFallback(messages, env); }
-      catch { return "That one's not coming through clearly — try asking a different way! 🎬"; }
-    }
-
-    // ── Step 4: Final generation with tool data ──
-    const finalMessages = [
-      ...messages,
-      assistantMessage,
-      ...toolResults
-    ];
-
-    let finalRes, finalData;
-    try {
-      finalRes = await fetchWithTimeout(GROQ_URL, {
-        method:  'POST',
-        headers: {
-          'Content-Type':  'application/json',
-          'Authorization': `Bearer ${env.GROQ_KEY}`
-        },
-        body: JSON.stringify({
-          model:       GROQ_MODEL,
-          messages:    finalMessages,
-          max_tokens:  750,
-          temperature: 0.78
-        })
-      }, 15000);
-
-      if (!finalRes.ok) return await geminiFallback(messages, env);
-      finalData = await finalRes.json();
-    } catch {
-      return await geminiFallback(messages, env);
-    }
-
-    if (!finalData.choices?.[0]?.message?.content) {
-      return await geminiFallback(messages, env);
-    }
-
-    return cleanResponse(finalData.choices[0].message.content);
-  }
-
-  // ── Direct reply — no tools needed ──
-  const direct = assistantMessage?.content;
-  if (direct) return cleanResponse(direct);
-
-  return await geminiFallback(messages, env);
-}
-
-// ============================================
-// MAIN FETCH HANDLER
+// CLOUDFLARE WORKER ENTRY POINT
 // ============================================
 export default {
   async fetch(request, env) {
     const url    = new URL(request.url);
     const origin = getAllowedOrigin(request);
 
+    // Preflight
     if (request.method === 'OPTIONS') {
       if (!origin) return new Response('Forbidden', { status: 403 });
-      return new Response(null, { headers: corsHeaders(origin) });
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
 
+    // Health check
     if (request.method === 'GET' && url.pathname === '/') {
-      return jsonRes({ status: 'Clappy Companion v4.3 🎬' }, 200, origin);
+      return jsonRes({ status: 'Clappy v5.0 🎬', ok: true }, 200, origin);
     }
 
+    // Main chat endpoint
     if (request.method === 'POST' && url.pathname === '/') {
       if (!origin) return jsonRes({ error: 'Forbidden' }, 403, null);
 
+      // Rate limit
       const ip      = request.headers.get('CF-Connecting-IP') || 'unknown';
       const allowed = await checkRateLimit(ip, env);
       if (!allowed) {
-        return jsonRes({ error: 'Too many requests. Slow down.' }, 429, origin);
+        return jsonRes({ error: 'Too many requests — slow down a little.' }, 429, origin);
       }
 
+      // Parse body
       let body;
       try { body = await request.json(); }
-      catch { return jsonRes({ error: 'Invalid request body' }, 400, origin); }
+      catch { return jsonRes({ error: 'Invalid JSON body' }, 400, origin); }
 
       const { messages, sessionMemory } = body;
-      if (!messages || !Array.isArray(messages)) {
-        return jsonRes({ error: 'messages array required' }, 400, origin);
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        return jsonRes({ error: 'messages array is required' }, 400, origin);
       }
 
-      const userMessage = messages[messages.length - 1]?.content;
+      const userMessage = messages[messages.length - 1]?.content?.trim();
       if (!userMessage) return jsonRes({ error: 'Empty message' }, 400, origin);
 
+      // History is everything except the last (current) message
       const history = messages.slice(0, -1).map(m => ({
         role: m.role, content: m.content
       }));
 
       try {
-        const reply = await orchestrate(
-          userMessage, sessionMemory || null, history, env
-        );
+        const reply = await orchestrate(userMessage, sessionMemory || null, history, env);
         return jsonRes({ reply }, 200, origin);
       } catch {
         return jsonRes({
@@ -787,4 +808,4 @@ export default {
 
     return jsonRes({ error: 'Not found' }, 404, origin);
   }
-};
+}; 

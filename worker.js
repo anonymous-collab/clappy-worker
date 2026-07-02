@@ -15,11 +15,17 @@ const PRODUCTION_ORIGINS = [
   '‎https://6a3d215c97aa7a78850f99bf--relaxed-kringle-570cc0.netlify.app',
 ];
 
+// ── Dev mode flag ─────────────────────────────
+// Set to true when testing locally in Acode.
+// Always set to false before deploying to production.
+// This controls whether localhost origins are allowed.
+const DEV_MODE = false;
+
 function isAllowedOrigin(origin) {
   if (!origin) return false;
   if (PRODUCTION_ORIGINS.includes(origin)) return true;
-  // Any localhost port — Acode changes port each session
-  if (/^http:\/\/localhost:\d+$/.test(origin)) return true;
+  // Only allow localhost when explicitly in dev mode
+  if (DEV_MODE && /^http:\/\/localhost:\d+$/.test(origin)) return true;
   return false;
 }
 
